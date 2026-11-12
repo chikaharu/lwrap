@@ -1,0 +1,90 @@
+#!/usr/bin/env python3
+# test_mcp.py -- smoke test for mcp_server.py (stdlib only).
+#
+# Spawns the server on stdio and checks: handshake, tools/list,
+# a build, a named refusal for a missing rootfs, and server survival.
+# If LWRAP_TEST_ROOTFS points at a rootfs with /bin/sh, it also runs
+# `id` inside the room and checks for uid=0.
+#
+#   python3 test_mcp.py
+#   LWRAP_TEST_ROOTFS=/path/to/rootfs python3 test_mcp.py
+import json
+import os
+import subprocess
+import sys
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+_id = [0]
+failures = []
+
+
+def check(name, ok, detail=""):
+    print("%s %s %s" % ("PASS" if ok else "FAIL", name, detail))
+    if not ok:
+        failures.append(name)
+
+
+server = subprocess.Popen([sys.executable, os.path.join(HERE, "mcp_server.py")],
+                          stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                          text=True)
+
+
+def request(method, params=None):
+    _id[0] += 1
+    server.stdin.write(json.dumps(
+        {"jsonrpc": "2.0", "id": _id[0], "method": method,
+         "params": params or {}}) + "\n")
+    server.stdin.flush()
+    return json.loads(server.stdout.readline())
+
+
+def call(name, arguments):
+    return request("tools/call",
+                   {"name": name, "arguments": arguments}).get("result") or {}
+
+
+init = request("initialize", {"protocolVersion": "2024-11-05",
+                              "capabilities": {},
+                              "clientInfo": {"name": "test_mcp",
+                                             "version": "0"}})
+res = init.get("result") or {}
+check("handshake", res.get("serverInfo", {}).get("name") == "lwrap",
+      json.dumps(res.get("serverInfo")))
+server.stdin.write(json.dumps(
+    {"jsonrpc": "2.0", "method": "notifications/initialized"}) + "\n")
+server.stdin.flush()
+
+tools = request("tools/list").get("result", {}).get("tools", [])
+check("tools/list", sorted(t["name"] for t in tools)
+      == ["lwrap_build", "lwrap_run", "lwrap_view"],
+      ",".join(t["name"] for t in tools))
+
+r = call("lwrap_build", {})
+info = {}
+try:
+    info = json.loads(r["content"][0]["text"])
+except ValueError:
+    pass
+check("lwrap_build", r.get("isError") is False
+      and info.get("size_bytes") == 14384, json.dumps(info))
+
+r = call("lwrap_run", {"rootfs": "/nonexistent-rootfs",
+                       "command": ["/bin/true"]})
+check("named refusal", r.get("isError") is True
+      and "edge bind_rootfs failed" in r["content"][0]["text"],
+      r["content"][0]["text"].strip().splitlines()[-1][:80])
+check("server alive", request("ping").get("result") == {})
+
+rootfs = os.environ.get("LWRAP_TEST_ROOTFS")
+if rootfs:
+    r = call("lwrap_run", {"rootfs": rootfs, "command": ["/bin/sh", "-c", "id"]})
+    out = json.loads(r["content"][0]["text"])
+    check("room run", out.get("exit_code") == 0
+          and "uid=0(root)" in out.get("stdout", ""), out.get("stdout", "").strip())
+else:
+    print("SKIP room run (set LWRAP_TEST_ROOTFS to enable)")
+
+server.stdin.close()
+server.wait(timeout=10)
+print("OVERALL", "PASS" if not failures else "FAIL %s" % failures)
+sys.exit(0 if not failures else 1)
