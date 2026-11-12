@@ -133,11 +133,16 @@ blob = bytes(range(256)) * 2  # 512 bytes = 64 lines
 r = call("lwrap_put", {"room": "scratch", "path": "/raw.bin",
                        "content_base64": _b64.b64encode(blob).decode()})
 r = call("lwrap_read8", {"room": "scratch", "path": "/raw.bin",
-                         "start": 10, "end": 12})
+                         "start": 11, "end": 12})
 info = json.loads(r["content"][0]["text"]) if not r.get("isError") else {}
-check("lwrap_read8 raw8 seek", _b64.b64decode(
+check("lwrap_read8 raw8 seek (lines from 1)", _b64.b64decode(
     info.get("content_base64", "")) == blob[80:96], json.dumps(info)[:80])
-recs = [_st.pack("<Q", n) + blob[8 * n:8 * n + 8] for n in range(64)]
+r = call("lwrap_read8", {"room": "scratch", "path": "/raw.bin",
+                         "start": 0, "end": 1})
+check("lwrap_read8 line 0 refused", r.get("isError") is True
+      and "line_out_of_range" in r["content"][0]["text"],
+      r["content"][0]["text"][:80])
+recs = [_st.pack("<Q", n) + blob[8 * (n - 1):8 * n] for n in range(1, 65)]
 recs.reverse()
 bag = b"LCARRY8\x00" + _st.pack("<Q", len(blob)) \
     + _hl.sha256(blob).digest() + b"".join(recs)
@@ -148,6 +153,18 @@ info = json.loads(r["content"][0]["text"]) if not r.get("isError") else {}
 check("lwrap_read8 bag8 shuffled", _b64.b64decode(
     info.get("content_base64", "")) == blob
     and info.get("digest_verified") is True, json.dumps(info)[:80])
+
+# Zero-check mechanism: "a\x00b" decodes as UTF-8 but is binary.
+r = call("lwrap_put", {"room": "scratch", "path": "/nul.bin",
+                       "content_base64": _b64.b64encode(b"a\x00b").decode()})
+r = call("lwrap_get", {"room": "scratch", "path": "/nul.bin"})
+info = json.loads(r["content"][0]["text"]) if not r.get("isError") else {}
+check("zero-check: NUL means binary", info.get("kind") == "binary"
+      and info.get("encoding") == "base64", json.dumps(info)[:90])
+r = call("lwrap_get", {"room": "scratch", "path": "/work/data.txt"})
+info = json.loads(r["content"][0]["text"]) if not r.get("isError") else {}
+check("zero-check: no NUL means text", info.get("kind") == "text",
+      json.dumps(info)[:90])
 r = call("lwrap_run", {"room": "demo", "command": ["/bin/true"]})
 check("alias resolves (run)", r.get("isError") is True
       and "edge bind_rootfs failed" in r["content"][0]["text"],

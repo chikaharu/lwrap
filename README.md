@@ -167,7 +167,11 @@ room: store data and a script, run the script in isolation with
 and containment is enforced on the resolved real path: a `..` that
 climbs above the room's root, and a symlink planted inside the room
 pointing outside, are both refused by name (`path_escapes_room`).
-Put/get are capped at 256 KiB per file.
+Put/get are capped at 256 KiB per file. Whether a file counts as
+text or binary is judged by the **zero-check mechanism**: no NUL
+byte means text, a NUL byte means binary — even when the bytes
+happen to decode as UTF-8 (`"a\0b"` is binary). `lwrap_get` and
+`lwrap_read8` report the result as a `kind` field.
 
 ### Line-carry reading
 
@@ -186,16 +190,19 @@ head vs. tail range reads cost the same (ratio 1.10).
 ### 8-byte lines
 
 Generalize the unit from a text line to 8 bytes: the address space
-is cut into 8-byte lines, the line number *is* the address, and the
-byte offset is `8 * n`. `lwrap_read8` reads a range `[start, end)`
-of line numbers in two forms:
+is cut into 8-byte lines, and the line number *is* the address.
+Lines are numbered from 1 in both readers (line 1 is the first
+line; line 0 is refused by name), the byte offset of line *n* is
+`8 * (n - 1)`, and ranges are inclusive. `lwrap_read8` reads lines
+in two forms:
 
 - **raw8** — the file itself is the lines. Reading seeks
   arithmetically: no scan, no index table. Measured: the same
   16-line read costs the same on a 32 KiB and a 256 KiB file
   (ratio 1.06; a scanning reader would pay ~8x). Overhead: zero.
 - **bag8** — a 48-byte header (magic, total byte length, sha256)
-  plus records of `[tag 8B][data 8B]`, each line explicitly
+  plus records of `[tag 8B][data 8B]` (tags are the 1-based line
+  numbers), each line explicitly
   carrying its number, so records may lie in any physical order.
   A complete bag is digest-verified on every read; a dropped
   record refuses as `missing_line_number` only for ranges that

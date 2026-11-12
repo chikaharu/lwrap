@@ -17,14 +17,20 @@
 #                so the physical order of records does not matter;
 #                a range [start, end] is loaded by number, and gaps
 #                or duplicates are refused by name
-#   lwrap_read8  read an address space whose lines are 8 bytes:
-#                the line number IS the address (byte offset = 8*n).
+#   lwrap_read8  read an address space whose lines are 8 bytes.
+#                Lines are numbered from 1 (line 1 is the first
+#                line, as in lwrap_read); the byte offset of line n
+#                is 8*(n-1), and line 0 is refused by name.
 #                raw8: the file itself is the lines; reading seeks
 #                arithmetically, no scan and no index. bag8: records
 #                of [tag 8B = line number][data 8B] under a 48-byte
 #                header (magic / total length / sha256); physical
 #                order is free, and a complete census is always
 #                digest-verified
+#
+# Text vs binary is judged by the zero-check mechanism: data with
+# no NUL byte is text, data containing a NUL byte is binary --
+# regardless of whether it happens to decode as UTF-8.
 #
 # put/get/ls treat the rootfs as the room's floor: files are stored
 # and loaded from the host side, under a strict containment rule --
@@ -78,7 +84,7 @@ import sys
 PROTOCOL_VERSION = "2024-11-05"
 SUPPORTED_VERSIONS = ["2024-11-05", "2025-03-26", "2025-06-18"]
 SERVER_NAME = "lwrap"
-SERVER_VERSION = "1.4.0"
+SERVER_VERSION = "1.5.0"
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 BUILDER = os.path.join(HERE, "sf_builder.py")
@@ -277,6 +283,15 @@ def tool_view(args):
 MAX_FILE = 256 * 1024
 
 
+def zero_check(data):
+    """The text/binary judgment: True (text) iff no NUL byte."""
+    return b"\x00" not in data
+
+
+def data_kind(data):
+    return "text" if zero_check(data) else "binary"
+
+
 def resolve_rootfs(args):
     """Shared room/rootfs argument handling for run/put/get/ls.
     Return (rootfs, error_text)."""
@@ -389,11 +404,20 @@ def tool_get(args):
     with open(host, "rb") as f:
         data = f.read()
     info = {"path": norm, "size_bytes": len(data),
-            "sha256": hashlib.sha256(data).hexdigest()}
-    try:
-        info["encoding"] = "utf-8"
-        info["content"] = data.decode("utf-8")
-    except UnicodeDecodeError:
+            "sha256": hashlib.sha256(data).hexdigest(),
+            "kind": data_kind(data)}
+    # Text/binary is judged by the zero-check mechanism: no NUL
+    # byte means text. UTF-8 validity alone does not make text --
+    # "a\x00b" decodes fine but is binary by the zero-check.
+    if info["kind"] == "text":
+        try:
+            info["encoding"] = "utf-8"
+            info["content"] = data.decode("utf-8")
+        except UnicodeDecodeError:
+            info["kind"] = "binary"
+            info["encoding"] = "base64"
+            info["content"] = base64.b64encode(data).decode("ascii")
+    else:
         info["encoding"] = "base64"
         info["content"] = base64.b64encode(data).decode("ascii")
     return (json.dumps(info, indent=2, ensure_ascii=False), info, False)
@@ -511,9 +535,10 @@ def tool_read8(args):
         return ("file_too_large: %s is %d bytes (cap %d)"
                 % (norm, size, READ8_CAP), None, True)
     try:
-        start = int(args.get("start") or 0)
-        end = args.get("end")
-        end = None if end is None else int(end)
+        _s = args.get("start")
+        start = 1 if _s is None else int(_s)
+        _e = args.get("end")
+        end = None if _e is None else int(_e)
     except (TypeError, ValueError):
         return ("bad_argument: start/end must be integers", None, True)
 
@@ -521,24 +546,32 @@ def tool_read8(args):
         head = f.read(len(BAG8_MAGIC))
     is_bag = (head == BAG8_MAGIC)
 
+    def range_err(nlines):
+        return ("line_out_of_range: [%d, %d] of %d lines, numbered "
+                "from 1 (in %s)" % (start, end, nlines, norm),
+                None, True)
+
     if not is_bag:
         # raw8: the file itself is the lines; seek arithmetically.
+        # Line n lives at byte offset 8*(n-1); line 1 is first.
         nlines = (size + 7) // 8
         if end is None:
             end = nlines
-        if start < 0 or end < start or end > nlines:
-            return ("line_out_of_range: [%d, %d) of %d lines (in %s)"
-                    % (start, end, nlines, norm), None, True)
+        if start < 1 or end < start or end > nlines:
+            return range_err(nlines)
         with open(host, "rb") as f:
-            f.seek(8 * start)
-            data = f.read(min(8 * (end - start), size - 8 * start))
+            f.seek(8 * (start - 1))
+            data = f.read(min(8 * (end - start + 1),
+                              size - 8 * (start - 1)))
         info = {"path": norm, "format": "raw8", "start": start,
                 "end": end, "lines_total": nlines,
+                "kind": data_kind(data),
                 "byte_length": len(data),
                 "content_base64": base64.b64encode(data).decode("ascii")}
         return (json.dumps(info, indent=2), info, False)
 
-    # bag8: header 48B + records of [tag u64 LE][data 8B].
+    # bag8: header 48B + records of [tag u64 LE][data 8B]; tags are
+    # line numbers, numbered from 1.
     with open(host, "rb") as f:
         blob = f.read()
     if len(blob) < 48 or (len(blob) - 48) % 16 != 0:
@@ -549,9 +582,8 @@ def tool_read8(args):
     nlines = (total_len + 7) // 8
     if end is None:
         end = nlines
-    if start < 0 or end < start or end > nlines:
-        return ("line_out_of_range: [%d, %d) of %d lines (in %s)"
-                % (start, end, nlines, norm), None, True)
+    if start < 1 or end < start or end > nlines:
+        return range_err(nlines)
     records = {}
     body = blob[48:]
     for off in range(0, len(body), 16):
@@ -559,27 +591,29 @@ def tool_read8(args):
         if tag in records:
             return ("duplicate_line_number: %d (in %s)" % (tag, norm),
                     None, True)
-        if tag >= nlines:
-            return ("not_line8_bag_format: tag %d beyond %d lines "
-                    "(in %s)" % (tag, nlines, norm), None, True)
+        if tag < 1 or tag > nlines:
+            return ("not_line8_bag_format: tag %d is not a line of "
+                    "1..%d (in %s)" % (tag, nlines, norm), None, True)
         records[tag] = body[off + 8:off + 16]
-    missing = [n for n in range(start, end) if n not in records]
+    missing = [n for n in range(start, end + 1) if n not in records]
     if missing:
         return ("missing_line_number: %d (in %s)" % (missing[0], norm),
                 None, True)
     complete = len(records) == nlines
     digest_verified = False
     if complete:
-        full = b"".join(records[n] for n in range(nlines))[:total_len]
+        full = b"".join(records[n]
+                        for n in range(1, nlines + 1))[:total_len]
         if hashlib.sha256(full).digest() != want_sha:
             return ("digest_mismatch: %s (bag data does not match "
                     "its header)" % norm, None, True)
         digest_verified = True
-    data = b"".join(records[n] for n in range(start, end))
-    data = data[:max(0, min(len(data), total_len - 8 * start))]
+    data = b"".join(records[n] for n in range(start, end + 1))
+    data = data[:max(0, min(len(data), total_len - 8 * (start - 1)))]
     info = {"path": norm, "format": "bag8", "start": start, "end": end,
             "lines_total": nlines, "records": len(records),
             "digest_verified": digest_verified,
+            "kind": data_kind(data),
             "byte_length": len(data),
             "content_base64": base64.b64encode(data).decode("ascii")}
     return (json.dumps(info, indent=2), info, False)
@@ -703,9 +737,12 @@ TOOLS = [
         "name": "lwrap_get",
         "description": "Load a file from a room's floor. Returns the "
                        "content (UTF-8 text, or base64 for binary), "
-                       "its size and sha256. The resolved path must "
-                       "stay inside the room: a symlink pointing "
-                       "outside is refused by name. Cap 256 KiB.",
+                       "its size and sha256, and a kind. Text vs "
+                       "binary is judged by the zero-check mechanism: "
+                       "no NUL byte means text, a NUL byte means "
+                       "binary. The resolved path must stay inside "
+                       "the room: a symlink pointing outside is "
+                       "refused by name. Cap 256 KiB.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -779,17 +816,20 @@ TOOLS = [
     {
         "name": "lwrap_read8",
         "description": "Read an address space whose lines are 8 "
-                       "bytes: the line number is the address, the "
-                       "byte offset is 8*n. Range is [start, end) in "
-                       "line numbers (0-based). Two forms: raw8 -- "
-                       "the file itself is the lines and reading "
-                       "seeks arithmetically (no scan, no index); "
-                       "bag8 -- a header (magic, total length, "
-                       "sha256) plus records of [tag 8B][data 8B] "
-                       "whose physical order is free; a complete "
-                       "bag is digest-verified on every read. "
-                       "Returns base64 content. Missing, duplicate "
-                       "and out-of-range lines are refused by name.",
+                       "bytes. Lines are numbered from 1 (line 1 is "
+                       "the first line, as in lwrap_read); the byte "
+                       "offset of line n is 8*(n-1), and line 0 is "
+                       "refused by name. Range is [start, end], both "
+                       "inclusive. Two forms: raw8 -- the file itself "
+                       "is the lines and reading seeks arithmetically "
+                       "(no scan, no index); bag8 -- a header (magic, "
+                       "total length, sha256) plus records of "
+                       "[tag 8B][data 8B] whose physical order is "
+                       "free; a complete bag is digest-verified on "
+                       "every read. Returns base64 content plus a "
+                       "kind judged by the zero-check (no NUL byte "
+                       "= text). Missing, duplicate and out-of-range "
+                       "lines are refused by name.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -803,11 +843,11 @@ TOOLS = [
                          "description": "Room-absolute path of the "
                                         "raw8 or bag8 file."},
                 "start": {"type": "integer",
-                          "description": "First line number, 0-based "
-                                         "(default 0)."},
+                          "description": "First line number, from 1 "
+                                         "(default 1)."},
                 "end": {"type": "integer",
-                        "description": "Line number past the last to "
-                                       "read (default: all lines)."},
+                        "description": "Last line number, inclusive "
+                                       "(default: the last line)."},
             },
             "required": ["path"],
         },
