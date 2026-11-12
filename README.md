@@ -155,6 +155,17 @@ Tools:
 | `lwrap_rooms` | List the registered room aliases (see below) |
 | `lwrap_run` | Run a command inside a room (`--root`, optional `--pid` / `--proc` / `--workdir`); returns stdout, stderr, exit code |
 | `lwrap_view` | Print a room's composed identity from `DIR/.lwrap.lnk`, without entering it |
+| `lwrap_put` | Store a file onto a room's floor (write into its rootfs); returns size and sha256 |
+| `lwrap_get` | Load a file from a room's floor (text, or base64 for binary); returns size and sha256 |
+| `lwrap_ls` | List a directory inside a room, without entering it |
+
+With put/get/ls an AI client can do file work end-to-end inside a
+room: store data and a script, run the script in isolation with
+`lwrap_run`, and load the result back. File paths are room-absolute
+and containment is enforced on the resolved real path: a `..` that
+climbs above the room's root, and a symlink planted inside the room
+pointing outside, are both refused by name (`path_escapes_room`).
+Put/get are capped at 256 KiB per file.
 
 ### Room aliases
 
@@ -200,7 +211,7 @@ lwrap_run all pass). A smoke test is included as `test_mcp.py`.
 ```
 sf_builder.py      the builder (spec validation + C generation + build)
 spec_lwrap.json    the pole spec (the source of truth for lwrap)
-mcp_server.py      stdlib-only MCP server exposing lwrap as 4 tools
+mcp_server.py      stdlib-only MCP server exposing lwrap as 7 tools
 rooms.example.json example room-alias registry (copy to rooms.json)
 test_mcp.py        stdlib smoke test for the MCP server
 docs/              format spec and measured results

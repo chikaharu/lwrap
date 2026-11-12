@@ -20,11 +20,16 @@ failures = []
 # A throwaway alias registry, so the alias tests do not depend on a
 # local rooms.json: "demo" resolves to paths that do not exist, which
 # is enough to prove resolution happened (the refusal names the edge).
+# "scratch" is a real empty directory used as a room floor for the
+# file-tool tests.
 import tempfile
+_scratch = tempfile.mkdtemp(prefix="lwrap-scratch-")
 _reg = tempfile.NamedTemporaryFile("w", suffix=".json", delete=False)
 json.dump({"rooms": {"demo": {"rootfs": "/nonexistent-rootfs",
                               "dir": "/nonexistent-room",
-                              "description": "demo alias"}}}, _reg)
+                              "description": "demo alias"},
+                     "scratch": {"rootfs": _scratch,
+                                 "description": "scratch floor"}}}, _reg)
 _reg.close()
 os.environ["LWRAP_ROOMS_JSON"] = _reg.name
 
@@ -67,13 +72,42 @@ server.stdin.flush()
 
 tools = request("tools/list").get("result", {}).get("tools", [])
 check("tools/list", sorted(t["name"] for t in tools)
-      == ["lwrap_build", "lwrap_rooms", "lwrap_run", "lwrap_view"],
+      == ["lwrap_build", "lwrap_get", "lwrap_ls", "lwrap_put",
+          "lwrap_rooms", "lwrap_run", "lwrap_view"],
       ",".join(t["name"] for t in tools))
 
 r = call("lwrap_rooms", {})
 info = json.loads(r["content"][0]["text"])
-check("lwrap_rooms", [x["name"] for x in info["rooms"]] == ["demo"],
-      json.dumps(info["rooms"]))
+check("lwrap_rooms", [x["name"] for x in info["rooms"]]
+      == ["demo", "scratch"], json.dumps(info["rooms"]))
+
+# File tools on the scratch floor: put -> ls -> get round-trip,
+# then the two escape refusals.
+r = call("lwrap_put", {"room": "scratch", "path": "/work/data.txt",
+                       "content": "hello room\n"})
+info = json.loads(r["content"][0]["text"]) if not r.get("isError") else {}
+check("lwrap_put", r.get("isError") is False
+      and info.get("size_bytes") == 11, json.dumps(info))
+r = call("lwrap_ls", {"room": "scratch", "path": "/work"})
+info = json.loads(r["content"][0]["text"])
+check("lwrap_ls", [e["name"] for e in info["entries"]] == ["data.txt"]
+      and info["entries"][0]["size"] == 11, json.dumps(info["entries"]))
+r = call("lwrap_get", {"room": "scratch", "path": "/work/data.txt"})
+info = json.loads(r["content"][0]["text"])
+check("lwrap_get", info.get("content") == "hello room\n",
+      json.dumps(info)[:80])
+r = call("lwrap_put", {"room": "scratch", "path": "/../evil.txt",
+                       "content": "escape"})
+check("put escape refused", r.get("isError") is True
+      and "path_escapes_room" in r["content"][0]["text"]
+      and not os.path.exists(os.path.join(
+          os.path.dirname(_scratch), "evil.txt")),
+      r["content"][0]["text"])
+os.symlink("/etc/hostname", os.path.join(_scratch, "peek"))
+r = call("lwrap_get", {"room": "scratch", "path": "/peek"})
+check("get symlink escape refused", r.get("isError") is True
+      and "path_escapes_room" in r["content"][0]["text"],
+      r["content"][0]["text"])
 r = call("lwrap_run", {"room": "demo", "command": ["/bin/true"]})
 check("alias resolves (run)", r.get("isError") is True
       and "edge bind_rootfs failed" in r["content"][0]["text"],

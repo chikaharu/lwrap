@@ -9,6 +9,15 @@
 #   lwrap_rooms  list the room aliases from the registry (rooms.json)
 #   lwrap_run    run a command inside a room (lwrap --root ... -- CMD)
 #   lwrap_view   print a room's composed identity (lwrap --view DIR)
+#   lwrap_put    store a file onto a room's floor (into its rootfs)
+#   lwrap_get    load a file from a room's floor
+#   lwrap_ls     list a directory inside a room
+#
+# put/get/ls treat the rootfs as the room's floor: files are stored
+# and loaded from the host side, under a strict containment rule --
+# the resolved real path must stay inside the rootfs. Escapes via
+# ".." or via a symlink planted inside the room are refused by name
+# (path_escapes_room). File size cap for put/get: 256 KiB.
 #
 # Rooms can be called by alias instead of by absolute path. The
 # registry is a JSON file: rooms.json beside this script, or the path
@@ -46,6 +55,7 @@
 #       "command": "python3",
 #       "args": ["/path/to/lwrap/mcp_server.py"]}}}
 
+import base64
 import hashlib
 import json
 import os
@@ -55,7 +65,7 @@ import sys
 PROTOCOL_VERSION = "2024-11-05"
 SUPPORTED_VERSIONS = ["2024-11-05", "2025-03-26", "2025-06-18"]
 SERVER_NAME = "lwrap"
-SERVER_VERSION = "1.1.0"
+SERVER_VERSION = "1.2.0"
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 BUILDER = os.path.join(HERE, "sf_builder.py")
@@ -246,6 +256,163 @@ def tool_view(args):
     return (text, {"view": text}, False)
 
 
+# ------------------------------------------------------------------
+# File tools: Store (put) / Load (get) / list (ls) on a room's floor.
+# Containment: the resolved real path must stay inside the rootfs.
+# ------------------------------------------------------------------
+
+MAX_FILE = 256 * 1024
+
+
+def resolve_rootfs(args):
+    """Shared room/rootfs argument handling for run/put/get/ls.
+    Return (rootfs, error_text)."""
+    rootfs = args.get("rootfs")
+    if args.get("room") and rootfs:
+        return None, ("conflicting_arguments: give room or rootfs, "
+                      "not both")
+    if args.get("room"):
+        rootfs, err = resolve_alias(str(args["room"]), "rootfs")
+        if err:
+            return None, err
+    if not rootfs:
+        return None, "missing_argument: rootfs (or room, an alias)"
+    if not os.path.isdir(rootfs):
+        return None, "rootfs_not_found: %s" % rootfs
+    return rootfs, None
+
+
+def _within(root_real, path):
+    return (path == root_real
+            or path.startswith(root_real.rstrip(os.sep) + os.sep))
+
+
+def _room_target(rootfs, inside):
+    """Map a room-absolute path (e.g. /tmp/x) into the rootfs and
+    verify containment of the resolved path. Return (host_path,
+    normalised_inside, error_text). Symlinks on the final component
+    are followed here; callers that write check for links first."""
+    if inside is None or str(inside) == "":
+        return None, None, "missing_argument: path"
+    root_real = os.path.realpath(rootfs)
+    # Paths are room-absolute. A ".." that would climb above the
+    # room's root is an escape attempt, refused rather than clamped.
+    rel = os.path.normpath(str(inside).lstrip("/"))
+    if rel == ".." or rel.startswith(".." + os.sep):
+        return None, None, ("path_escapes_room: %s climbs above the "
+                            "room's root" % inside)
+    norm = "/" if rel == "." else "/" + rel
+    host = root_real + norm
+    resolved = os.path.realpath(host)
+    if not _within(root_real, resolved):
+        return None, norm, ("path_escapes_room: %s resolves outside "
+                            "the room" % inside)
+    return host, norm, None
+
+
+def tool_put(args):
+    rootfs, err = resolve_rootfs(args)
+    if err:
+        return (err, None, True)
+    host, norm, err = _room_target(rootfs, args.get("path"))
+    if err:
+        return (err, None, True)
+    if args.get("content") is not None and args.get("content_base64"):
+        return ("conflicting_arguments: give content or "
+                "content_base64, not both", None, True)
+    if args.get("content") is not None:
+        data = str(args["content"]).encode("utf-8")
+    elif args.get("content_base64"):
+        try:
+            data = base64.b64decode(str(args["content_base64"]),
+                                    validate=True)
+        except ValueError:
+            return ("bad_argument: content_base64 is not valid base64",
+                    None, True)
+    else:
+        return ("missing_argument: content (or content_base64)",
+                None, True)
+    if len(data) > MAX_FILE:
+        return ("file_too_large: %d bytes (cap %d)"
+                % (len(data), MAX_FILE), None, True)
+    if os.path.islink(host):
+        return ("path_is_symlink: %s" % norm, None, True)
+    if os.path.isdir(host):
+        return ("not_a_file: %s is a directory" % norm, None, True)
+    # Create parent directories, but never through a planted symlink:
+    # verify the deepest existing ancestor resolves inside the room.
+    root_real = os.path.realpath(rootfs)
+    parent = os.path.dirname(host)
+    ancestor = parent
+    while not os.path.exists(ancestor):
+        ancestor = os.path.dirname(ancestor)
+    if not _within(root_real, os.path.realpath(ancestor)):
+        return ("path_escapes_room: parent of %s resolves outside "
+                "the room" % norm, None, True)
+    os.makedirs(parent, exist_ok=True)
+    with open(host, "wb") as f:
+        f.write(data)
+    info = {"path": norm, "size_bytes": len(data),
+            "sha256": hashlib.sha256(data).hexdigest()}
+    return (json.dumps(info, indent=2), info, False)
+
+
+def tool_get(args):
+    rootfs, err = resolve_rootfs(args)
+    if err:
+        return (err, None, True)
+    host, norm, err = _room_target(rootfs, args.get("path"))
+    if err:
+        return (err, None, True)
+    if not os.path.exists(host):
+        return ("file_not_found: %s" % norm, None, True)
+    if os.path.isdir(host):
+        return ("not_a_file: %s is a directory (use lwrap_ls)"
+                % norm, None, True)
+    size = os.path.getsize(host)
+    if size > MAX_FILE:
+        return ("file_too_large: %s is %d bytes (cap %d)"
+                % (norm, size, MAX_FILE), None, True)
+    with open(host, "rb") as f:
+        data = f.read()
+    info = {"path": norm, "size_bytes": len(data),
+            "sha256": hashlib.sha256(data).hexdigest()}
+    try:
+        info["encoding"] = "utf-8"
+        info["content"] = data.decode("utf-8")
+    except UnicodeDecodeError:
+        info["encoding"] = "base64"
+        info["content"] = base64.b64encode(data).decode("ascii")
+    return (json.dumps(info, indent=2, ensure_ascii=False), info, False)
+
+
+def tool_ls(args):
+    rootfs, err = resolve_rootfs(args)
+    if err:
+        return (err, None, True)
+    host, norm, err = _room_target(rootfs, args.get("path") or "/")
+    if err:
+        return (err, None, True)
+    if not os.path.exists(host):
+        return ("file_not_found: %s" % norm, None, True)
+    if not os.path.isdir(host):
+        return ("not_a_directory: %s" % norm, None, True)
+    entries = []
+    for name in sorted(os.listdir(host)):
+        st = os.lstat(os.path.join(host, name))
+        if os.path.islink(os.path.join(host, name)):
+            kind = "link"
+        elif os.path.isdir(os.path.join(host, name)):
+            kind = "dir"
+        elif os.path.isfile(os.path.join(host, name)):
+            kind = "file"
+        else:
+            kind = "other"
+        entries.append({"name": name, "type": kind, "size": st.st_size})
+    info = {"path": norm, "entries": entries}
+    return (json.dumps(info, indent=2, ensure_ascii=False), info, False)
+
+
 TOOLS = [
     {
         "name": "lwrap_build",
@@ -328,6 +495,80 @@ TOOLS = [
             },
         },
         "handler": tool_view,
+    },
+    {
+        "name": "lwrap_put",
+        "description": "Store a file onto a room's floor (write into "
+                       "its rootfs at a room-absolute path, e.g. "
+                       "/work/data.csv). Parent directories are "
+                       "created. The resolved path must stay inside "
+                       "the room: escapes via '..' or symlinks are "
+                       "refused by name. Cap 256 KiB.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "rootfs": {"type": "string",
+                           "description": "Path to the room's rootfs. "
+                                          "Give either rootfs or room."},
+                "room": {"type": "string",
+                         "description": "Alias from the rooms registry "
+                                        "(see lwrap_rooms)."},
+                "path": {"type": "string",
+                         "description": "Room-absolute destination, "
+                                        "e.g. /work/data.csv."},
+                "content": {"type": "string",
+                            "description": "File content as text "
+                                           "(UTF-8)."},
+                "content_base64": {"type": "string",
+                                   "description": "File content as "
+                                                  "base64 (for binary)."},
+            },
+            "required": ["path"],
+        },
+        "handler": tool_put,
+    },
+    {
+        "name": "lwrap_get",
+        "description": "Load a file from a room's floor. Returns the "
+                       "content (UTF-8 text, or base64 for binary), "
+                       "its size and sha256. The resolved path must "
+                       "stay inside the room: a symlink pointing "
+                       "outside is refused by name. Cap 256 KiB.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "rootfs": {"type": "string",
+                           "description": "Path to the room's rootfs. "
+                                          "Give either rootfs or room."},
+                "room": {"type": "string",
+                         "description": "Alias from the rooms registry "
+                                        "(see lwrap_rooms)."},
+                "path": {"type": "string",
+                         "description": "Room-absolute path to read."},
+            },
+            "required": ["path"],
+        },
+        "handler": tool_get,
+    },
+    {
+        "name": "lwrap_ls",
+        "description": "List a directory inside a room (names, types, "
+                       "sizes), without entering the room.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "rootfs": {"type": "string",
+                           "description": "Path to the room's rootfs. "
+                                          "Give either rootfs or room."},
+                "room": {"type": "string",
+                         "description": "Alias from the rooms registry "
+                                        "(see lwrap_rooms)."},
+                "path": {"type": "string",
+                         "description": "Room-absolute directory "
+                                        "(default /)."},
+            },
+        },
+        "handler": tool_ls,
     },
 ]
 
