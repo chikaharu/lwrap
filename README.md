@@ -160,6 +160,10 @@ Tools:
 | `lwrap_ls` | List a directory inside a room, without entering it |
 | `lwrap_read` | Read a line-carry file by line-number coordinates (below) |
 | `lwrap_read8` | Read an address space of 8-byte lines (below) |
+| `lwrap_store8` | Write one 8-byte line into a bag (append a generation) |
+| `lwrap_drop8` | Delete one line from a bag (append a tombstone) |
+| `lwrap_defrag` | Fold a bag's record chain into a ledger; the bag is untouched |
+| `lwrap_rm` | Remove a file (and its fold ledger) from a room |
 
 With put/get/ls an AI client can do file work end-to-end inside a
 room: store data and a script, run the script in isolation with
@@ -212,6 +216,31 @@ in two forms:
   data. Placement freedom is bought with the tag; in-place is free
   because the number is arithmetic.
 
+### Writing, deleting, and defrag (the Link fold)
+
+`lwrap_store8` writes a line by *appending* a record — a new
+generation; no existing record ever moves, so writes deliberately
+fragment the bag, and a later record for the same line wins.
+`lwrap_drop8` deletes by appending a tombstone record (the tag's
+top bit). Reads resolve generations and tombstones, and report
+how many superseded records (`generations`) they folded over.
+
+`lwrap_defrag` defragments the Link way: it folds the record
+chain once into a ledger file `<path>.fold.json` — an offsets
+table (line → winning record), the logical digest, and the gap
+list — **without modifying the bag's bytes at all**. The folded
+ledger is the defragmented entity. Reads verify against the
+ledger until the bag grows again (an append makes the fold
+stale, and reads honestly report `digest_verified: false`).
+
+Measured honestly: on a 2,000-line × 5-generation bag, folding
+(11.2 ms) was *slower* than materialized compaction (6.6 ms) —
+both pay the same full scan, and this bag's reads were never
+chain walks, so the 2026 fold advantage does not apply here.
+The fold's value in this form is not speed but that the bag
+never changes: offsets stay stable and the digest settles in
+place. `lwrap_rm` removes a file together with its ledger.
+
 ### Room aliases
 
 Rooms can be called by name instead of by absolute path. Create a
@@ -256,7 +285,7 @@ lwrap_run all pass). A smoke test is included as `test_mcp.py`.
 ```
 sf_builder.py      the builder (spec validation + C generation + build)
 spec_lwrap.json    the pole spec (the source of truth for lwrap)
-mcp_server.py      stdlib-only MCP server exposing lwrap as 9 tools
+mcp_server.py      stdlib-only MCP server exposing lwrap as 13 tools
 rooms.example.json example room-alias registry (copy to rooms.json)
 test_mcp.py        stdlib smoke test for the MCP server
 docs/              format spec and measured results

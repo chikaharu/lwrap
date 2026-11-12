@@ -72,8 +72,9 @@ server.stdin.flush()
 
 tools = request("tools/list").get("result", {}).get("tools", [])
 check("tools/list", sorted(t["name"] for t in tools)
-      == ["lwrap_build", "lwrap_get", "lwrap_ls", "lwrap_put",
-          "lwrap_read", "lwrap_read8", "lwrap_rooms", "lwrap_run",
+      == ["lwrap_build", "lwrap_defrag", "lwrap_drop8", "lwrap_get",
+          "lwrap_ls", "lwrap_put", "lwrap_read", "lwrap_read8",
+          "lwrap_rm", "lwrap_rooms", "lwrap_run", "lwrap_store8",
           "lwrap_view"],
       ",".join(t["name"] for t in tools))
 
@@ -153,6 +154,41 @@ info = json.loads(r["content"][0]["text"]) if not r.get("isError") else {}
 check("lwrap_read8 bag8 shuffled", _b64.b64decode(
     info.get("content_base64", "")) == blob
     and info.get("digest_verified") is True, json.dumps(info)[:80])
+
+# Write side: store8 appends generations, drop8 tombstones,
+# defrag folds without touching the bag, rm removes file + fold.
+import hashlib as _h2
+for _n, _d in [(2, b"line-two"), (1, b"line-one"), (3, b"line-3!!")]:
+    r = call("lwrap_store8", {"room": "scratch", "path": "/w.bag8",
+                              "line": _n,
+                              "data_base64": _b64.b64encode(_d).decode()})
+call("lwrap_store8", {"room": "scratch", "path": "/w.bag8", "line": 2,
+                      "data_base64": _b64.b64encode(b"GEN2!!!!").decode()})
+r = call("lwrap_read8", {"room": "scratch", "path": "/w.bag8",
+                         "start": 1, "end": 3})
+info = json.loads(r["content"][0]["text"]) if not r.get("isError") else {}
+check("store8 generations resolve", _b64.b64decode(
+    info.get("content_base64", ""))
+    == b"line-oneGEN2!!!!line-3!!", json.dumps(info)[:90])
+_bag_host = os.path.join(_scratch, "w.bag8")
+_sha0 = _h2.sha256(open(_bag_host, "rb").read()).hexdigest()
+r = call("lwrap_defrag", {"room": "scratch", "path": "/w.bag8"})
+_sha1 = _h2.sha256(open(_bag_host, "rb").read()).hexdigest()
+r = call("lwrap_read8", {"room": "scratch", "path": "/w.bag8",
+                         "start": 1, "end": 3})
+info = json.loads(r["content"][0]["text"]) if not r.get("isError") else {}
+check("defrag folds, bag untouched, verified", _sha0 == _sha1
+      and info.get("digest_verified") is True
+      and info.get("digest_via") == "fold", json.dumps(info)[:90])
+call("lwrap_drop8", {"room": "scratch", "path": "/w.bag8", "line": 2})
+r = call("lwrap_read8", {"room": "scratch", "path": "/w.bag8",
+                         "start": 1, "end": 3})
+check("drop8 tombstone refuses by name", r.get("isError") is True
+      and "missing_line_number: 2" in r["content"][0]["text"],
+      r["content"][0]["text"][:80])
+r = call("lwrap_rm", {"room": "scratch", "path": "/w.bag8"})
+check("rm removes file and fold", not os.path.exists(_bag_host)
+      and not os.path.exists(_bag_host + ".fold.json"), "")
 
 # Zero-check mechanism: "a\x00b" decodes as UTF-8 but is binary.
 r = call("lwrap_put", {"room": "scratch", "path": "/nul.bin",
