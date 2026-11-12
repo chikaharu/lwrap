@@ -36,6 +36,16 @@
       ]
     },
     {
+      "glue": "the room gets its own network namespace (its own interfaces, routes and sockets); loopback is brought up so 127.0.0.1 works inside",
+      "name": "unshare_net",
+      "optional": true,
+      "runtime_flag": "--net",
+      "syscalls": [
+        "unshare(CLONE_NEWNET)",
+        "ioctl(SIOCSIFFLAGS) on lo: IFF_UP|IFF_RUNNING"
+      ]
+    },
+    {
       "glue": "child becomes pid 1 of a new pid namespace; parent waits and propagates the exit code",
       "name": "unshare_pid",
       "optional": true,
@@ -69,6 +79,16 @@
       ]
     },
     {
+      "glue": "host device nodes (param devices, or --device PATH, repeatable) are bind-mounted into rootfs/dev: the room sees exactly the devices it is given, no others. This is how a GPU is handed in (e.g. /dev/nvidia0, /dev/nvidiactl, /dev/nvidia-uvm)",
+      "name": "bind_device",
+      "optional": true,
+      "runtime_flag": "--device",
+      "syscalls": [
+        "mkdir(rootfs/dev)",
+        "mount(device, rootfs/dev/<basename>, MS_BIND)"
+      ]
+    },
+    {
       "glue": "cross the threshold: / is now the rootfs",
       "name": "chroot_rootfs",
       "syscalls": [
@@ -83,6 +103,15 @@
       ]
     },
     {
+      "glue": "pin the command to the CPUs named by param cpus / --cpus (list like 0, 0-1, 0,2): a device-side restriction done with sched_setaffinity, no cgroup delegation needed",
+      "name": "pin_cpus",
+      "optional": true,
+      "runtime_flag": "--cpus",
+      "syscalls": [
+        "sched_setaffinity(0, mask)"
+      ]
+    },
+    {
       "glue": "the pole's algorithm runs: the command replaces this process",
       "name": "exec_cmd",
       "syscalls": [
@@ -91,7 +120,10 @@
     }
   ],
   "params": {
+    "cpus": "",
+    "devices": [],
     "gid": 0,
+    "net": false,
     "pid": false,
     "proc": false,
     "rootfs": "./rootfs",
@@ -105,7 +137,10 @@
         "--root DIR",
         "--proc",
         "--pid",
+        "--net",
         "--workdir DIR",
+        "--cpus LIST",
+        "--device PATH",
         "-- CMD..."
       ],
       "env": "not inherited; the edge exec_cmd installs a minimal generated env (PATH, HOME, TERM)",

@@ -36,12 +36,15 @@ EDGE_PHASES = {
     "write_uid_map":      30,   # write "inner outer 1" -> /proc/self/uid_map
     "write_gid_map":      40,   # same for gid_map
     "unshare_mount":      50,   # unshare(CLONE_NEWNS)
+    "unshare_net":        55,   # unshare(CLONE_NEWNET) + loopback up (optional)
     "unshare_pid":        60,   # unshare(CLONE_NEWPID) + fork (optional edge)
     "mount_private_root": 70,   # mount(NULL,"/",MS_REC|MS_PRIVATE)
     "bind_rootfs":        80,   # mount(rootfs, rootfs, MS_BIND|MS_REC)
     "mount_proc":         90,   # mount("proc", rootfs/proc)   (optional edge)
+    "bind_device":        95,   # bind host device nodes into rootfs/dev (optional)
     "chroot_rootfs":     100,   # chroot(rootfs)
     "chdir_work":        110,   # chdir(workdir)
+    "pin_cpus":          115,   # sched_setaffinity from --cpus (optional edge)
     "exec_cmd":          120,   # execve(cmd) with /bin,/usr/bin search
 }
 
@@ -83,6 +86,11 @@ def validate(spec):
         fail("mount_proc requires bind_rootfs before it")
     if "chroot_rootfs" in names and "bind_rootfs" not in names:
         fail("chroot_rootfs requires bind_rootfs before it")
+    if "bind_device" in names and "bind_rootfs" not in names:
+        fail("bind_device requires bind_rootfs before it")
+    if "unshare_net" in names and "unshare_user" not in names:
+        fail("unshare_net requires unshare_user before it "
+             "(an unprivileged net namespace lives in a user ns)")
     return names
 
 
@@ -108,6 +116,10 @@ typedef long i64;
 #define SYS_write    1
 #define SYS_open     2
 #define SYS_close    3
+#define SYS_ioctl    16
+#define SYS_socket   41
+#define SYS_mkdir    83
+#define SYS_sched_setaffinity 203
 #define SYS_fork     57
 #define SYS_execve   59
 #define SYS_exit     60
@@ -122,6 +134,7 @@ typedef long i64;
 
 #define CLONE_NEWUSER 0x10000000
 #define CLONE_NEWNS   0x00020000
+#define CLONE_NEWNET  0x40000000
 #define CLONE_NEWPID  0x20000000
 
 #define MS_BIND      4096UL
@@ -176,11 +189,17 @@ static const long  P_UID      = %(p_uid)s;
 static const long  P_GID      = %(p_gid)s;
 static const int   P_PROC     = %(p_proc)s;
 static const int   P_PID      = %(p_pid)s;
+static const int   P_NET      = %(p_net)s;
+static const char *P_CPUS     = "%(p_cpus)s";
+static const char *P_DEVICES[] = { %(p_devices)s 0 };
 
 /* ---- runtime state (filled by argv parsing) ---- */
 static const char *g_rootfs;
 static const char *g_workdir;
-static int g_proc, g_pid;
+static int g_proc, g_pid, g_net;
+static const char *g_cpus;
+static const char *g_rtdev[16];
+static int g_nrtdev;
 static char **g_cmd;
 static char g_procpath[1024];
 
@@ -435,6 +454,23 @@ static void step_unshare_mount(void){
 }
 """
 
+C_STEP["unshare_net"] = r"""
+static void step_unshare_net(void){
+    if(!g_net) return;                /* optional edge: --net switches it on */
+    edge_die("unshare_net", sc1(SYS_unshare, CLONE_NEWNET));
+    /* bring loopback up: socket + ioctl(SIOCSIFFLAGS) on "lo" */
+    i64 fd = sc3(SYS_socket, 2 /*AF_INET*/, 2 /*SOCK_DGRAM*/, 0);
+    edge_die("unshare_net", fd);
+    char ifreq[40];
+    for(int i = 0; i < 40; i++) ifreq[i] = 0;
+    ifreq[0] = 'l'; ifreq[1] = 'o';
+    *(short *)(ifreq + 16) = 0x1 | 0x40;      /* IFF_UP | IFF_RUNNING */
+    edge_die("unshare_net", sc3(SYS_ioctl, fd, 0x8914 /*SIOCSIFFLAGS*/,
+                                (i64)ifreq));
+    sc1(SYS_close, fd);
+}
+"""
+
 C_STEP["unshare_pid"] = r"""
 static void step_unshare_pid(void){
     if(!g_pid) return;               /* optional edge: --pid switches it on */
@@ -474,6 +510,30 @@ static void step_mount_proc(void){
 }
 """
 
+C_STEP["bind_device"] = r"""
+static void bind_one_device(const char *dev){
+    /* target: <rootfs>/dev/<basename(dev)>; create the mount
+     * point file, then bind the host device node over it.  A
+     * device that does not exist on the host fails by name. */
+    char dir[1200], tgt[1200];
+    scat(dir, g_rootfs, "/dev");
+    sc2(SYS_mkdir, (i64)dir, 0755);           /* EEXIST is fine */
+    const char *base = dev;
+    for(const char *p = dev; *p; p++) if(*p == '/') base = p + 1;
+    u64 n = slen(dir);
+    if(n + 1 + slen(base) >= sizeof(tgt)) edge_fail("bind_device", -36);
+    scat(tgt, dir, "/"); scat(tgt + n + 1, base, "");
+    i64 fd = sc3(SYS_open, (i64)tgt, 0x41 /*O_CREAT|O_WRONLY*/, 0600);
+    if(fd >= 0) sc1(SYS_close, fd);
+    edge_die("bind_device",
+        sc5(SYS_mount, (i64)dev, (i64)tgt, 0, MS_BIND, 0));
+}
+static void step_bind_device(void){
+    for(int i = 0; P_DEVICES[i]; i++) bind_one_device(P_DEVICES[i]);
+    for(int i = 0; i < g_nrtdev; i++) bind_one_device(g_rtdev[i]);
+}
+"""
+
 C_STEP["chroot_rootfs"] = r"""
 static void step_chroot_rootfs(void){
     edge_die("chroot_rootfs", sc1(SYS_chroot, (i64)g_rootfs));
@@ -483,6 +543,37 @@ static void step_chroot_rootfs(void){
 C_STEP["chdir_work"] = r"""
 static void step_chdir_work(void){
     edge_die("chdir_work", sc1(SYS_chdir, (i64)g_workdir));
+}
+"""
+
+C_STEP["pin_cpus"] = r"""
+static long cpu_num(const char **pp){
+    long v = 0;
+    while(**pp >= '0' && **pp <= '9'){ v = v * 10 + (**pp - '0'); (*pp)++; }
+    return v;
+}
+static void step_pin_cpus(void){
+    const char *s = g_cpus;
+    if(!s || !*s) return;             /* optional edge: --cpus LIST */
+    u64 mask = 0;
+    const char *p = s;
+    while(*p){
+        if(*p < '0' || *p > '9'){
+            eprint("lwrap: edge pin_cpus failed (bad cpu list)\n");
+            sc1(SYS_exit, 111);
+        }
+        long a = cpu_num(&p), b = a;
+        if(*p == '-'){ p++; b = cpu_num(&p); }
+        for(long k = a; k <= b && k < 64; k++) mask |= (1ULL << k);
+        if(*p == ',') p++;
+        else if(*p) {
+            eprint("lwrap: edge pin_cpus failed (bad cpu list)\n");
+            sc1(SYS_exit, 111);
+        }
+    }
+    if(mask)
+        edge_die("pin_cpus",
+            sc3(SYS_sched_setaffinity, 0, 8, (i64)&mask));
 }
 """
 
@@ -513,7 +604,7 @@ static void step_exec_cmd(void){
 
 C_MAIN = r"""
 static void usage(void){
-    eprint("usage: lwrap [--view DIR | -v DIR] [--root DIR] [--proc] [--pid] [--workdir DIR] -- CMD...\n");
+    eprint("usage: lwrap [--view DIR | -v DIR] [--root DIR] [--proc] [--pid] [--net] [--workdir DIR] [--cpus LIST] [--device PATH]... -- CMD...\n");
     sc1(SYS_exit, 64);
 }
 
@@ -532,12 +623,21 @@ __attribute__((used)) long cmain(long *sp){
     g_workdir = P_WORKDIR;
     g_proc    = P_PROC;
     g_pid     = P_PID;
+    g_net     = P_NET;
+    g_cpus    = P_CPUS;
+    g_nrtdev  = 0;
     long i = 1;
     for(; i < argc; i++){
         if(seq(argv[i], "--")){ i++; break; }
         else if(seq(argv[i], "--root") && i+1 < argc){ g_rootfs = argv[++i]; }
         else if(seq(argv[i], "--proc")){ g_proc = 1; }
         else if(seq(argv[i], "--pid")){ g_pid = 1; }
+        else if(seq(argv[i], "--net")){ g_net = 1; }
+        else if(seq(argv[i], "--cpus") && i+1 < argc){ g_cpus = argv[++i]; }
+        else if(seq(argv[i], "--device") && i+1 < argc){
+            if(g_nrtdev < 16) g_rtdev[g_nrtdev++] = argv[++i];
+            else usage();
+        }
         else if(seq(argv[i], "--workdir") && i+1 < argc){ g_workdir = argv[++i]; }
         else usage();
     }
@@ -573,6 +673,11 @@ def gen_c(spec):
         "p_gid": int(params.get("gid", 0)),
         "p_proc": 1 if params.get("proc", False) else 0,
         "p_pid": 1 if params.get("pid", False) else 0,
+        "p_net": 1 if params.get("net", False) else 0,
+        "p_cpus": str(params.get("cpus", "")).replace('"', ""),
+        "p_devices": "".join(
+            '"%s", ' % str(d).replace('"', "")
+            for d in params.get("devices", [])),
     }
     header = C_HEADER
     for k, v in subs.items():

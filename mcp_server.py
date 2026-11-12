@@ -93,7 +93,7 @@ import sys
 PROTOCOL_VERSION = "2024-11-05"
 SUPPORTED_VERSIONS = ["2024-11-05", "2025-03-26", "2025-06-18"]
 SERVER_NAME = "lwrap"
-SERVER_VERSION = "1.7.0"
+SERVER_VERSION = "1.8.0"
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 BUILDER = os.path.join(HERE, "sf_builder.py")
@@ -238,11 +238,21 @@ def tool_run(args):
         timeout = max(1, min(int(timeout), MAX_TIMEOUT))
     except (TypeError, ValueError):
         return ("bad_argument: timeout_sec must be an integer", None, True)
+    devices = args.get("devices")
+    if devices is not None and not isinstance(devices, list):
+        return ("bad_argument: devices must be a list of paths",
+                None, True)
     argv = [LWRAP, "--root", rootfs]
     if args.get("pid", True):
         argv.append("--pid")
     if args.get("proc", False):
         argv.append("--proc")
+    if args.get("net", False):
+        argv.append("--net")
+    if args.get("cpus"):
+        argv += ["--cpus", str(args["cpus"])]
+    for d in devices or []:
+        argv += ["--device", str(d)]
     if args.get("workdir"):
         argv += ["--workdir", str(args["workdir"])]
     argv += ["--"] + [str(c) for c in command]
@@ -995,6 +1005,26 @@ TOOLS = [
                 "proc": {"type": "boolean",
                          "description": "Mount a fresh /proc (default "
                                         "false; some hosts refuse it)."},
+                "net": {"type": "boolean",
+                        "description": "New network namespace: the "
+                                       "room has only loopback (up) "
+                                       "and cannot see the host's "
+                                       "interfaces (default false)."},
+                "cpus": {"type": "string",
+                         "description": "Pin the command to these "
+                                        "CPUs, e.g. \"0\", \"0-1\", "
+                                        "\"0,2\" (sched_setaffinity)."},
+                "devices": {"type": "array",
+                            "items": {"type": "string"},
+                            "description": "Host device nodes to "
+                                           "bind into the room's "
+                                           "/dev, e.g. [\"/dev/null\"] "
+                                           "or a GPU set "
+                                           "([\"/dev/nvidia0\", "
+                                           "\"/dev/nvidiactl\", "
+                                           "\"/dev/nvidia-uvm\"]). A "
+                                           "device missing on the "
+                                           "host is refused by name."},
                 "workdir": {"type": "string",
                             "description": "Working directory inside the "
                                            "room."},

@@ -226,7 +226,7 @@ try:
 except ValueError:
     pass
 check("lwrap_build", r.get("isError") is False
-      and info.get("size_bytes") == 14384, json.dumps(info))
+      and info.get("size_bytes") == 18680, json.dumps(info))
 
 r = call("lwrap_run", {"rootfs": "/nonexistent-rootfs",
                        "command": ["/bin/true"]})

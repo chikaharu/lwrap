@@ -14,7 +14,7 @@ static, `-nostdlib` ELF that uses raw syscalls only.
 
 ## Size
 
-- Built `lwrap` ELF: **14,384 bytes** (static, no interpreter, no libc)
+- Built `lwrap` ELF: **18,680 bytes** (static, no interpreter, no libc)
 - For comparison: `bwrap` 72,160 bytes, `proot` 183,464 bytes
 
 ## Build
@@ -31,7 +31,7 @@ with `#if !defined(__x86_64__)`).
 ## Usage
 
 ```sh
-./lwrap --root <rootfs> [--proc] [--pid] [--workdir DIR] -- CMD...
+./lwrap --root <rootfs> [--proc] [--pid] [--net] [--workdir DIR] [--cpus LIST] [--device PATH]... -- CMD...
 ./lwrap --view DIR        # print a room's composed identity from DIR/.lwrap.lnk
 ./lwrap -v DIR            # same as --view
 ```
@@ -41,6 +41,19 @@ with `#if !defined(__x86_64__)`).
 - `--proc` and `--pid` enable the optional `mount_proc` / `unshare_pid`
   edges. On hosts where mounting a fresh `/proc` is not permitted, the
   `mount_proc` edge fails by name (see Limitations).
+- `--net` gives the room its own network namespace: only loopback
+  (brought up) exists inside; the host's interfaces are invisible
+  and unreachable. Without it, the network is shared with the host.
+- `--cpus LIST` (e.g. `0`, `0-1`, `0,2`) pins the command to those
+  CPUs with `sched_setaffinity`. This is pinning, not a quota: no
+  cgroup is involved.
+- `--device PATH` (repeatable; or the spec's `devices` parameter)
+  bind-mounts a host device node into the room's `/dev`. The room
+  sees exactly the devices it is given. This is how a GPU is handed
+  in — e.g. `--device /dev/nvidia0 --device /dev/nvidiactl
+  --device /dev/nvidia-uvm` (the driver libraries are ordinary
+  files; ship them in the rootfs). A device that does not exist on
+  the host fails the `bind_device` edge by name.
 - The default rootfs compiled in from the spec (`./rootfs`) is only a
   default; `--root` overrides it at run time.
 
@@ -77,13 +90,16 @@ Edges, in the only legal order (enforced by the builder):
 | 3 | `write_uid_map` | map inner uid 0 to the caller's uid |
 | 4 | `write_gid_map` | same for gid |
 | 5 | `unshare_mount` | `unshare(CLONE_NEWNS)` |
-| 6 | `unshare_pid` *(optional, `--pid`)* | `unshare(CLONE_NEWPID)` + fork; parent propagates the exit code |
-| 7 | `mount_private_root` | `mount(none, /, MS_REC\|MS_PRIVATE)` |
-| 8 | `bind_rootfs` | bind-mount the rootfs onto itself |
-| 9 | `mount_proc` *(optional, `--proc`)* | mount a fresh `/proc` |
-| 10 | `chroot_rootfs` | `chroot(rootfs)` |
-| 11 | `chdir_work` | `chdir(workdir)` |
-| 12 | `exec_cmd` | `execve` with a `/bin`, `/usr/bin`, … search and the minimal env |
+| 6 | `unshare_net` *(optional, `--net`)* | `unshare(CLONE_NEWNET)`; loopback brought up by ioctl |
+| 7 | `unshare_pid` *(optional, `--pid`)* | `unshare(CLONE_NEWPID)` + fork; parent propagates the exit code |
+| 8 | `mount_private_root` | `mount(none, /, MS_REC\|MS_PRIVATE)` |
+| 9 | `bind_rootfs` | bind-mount the rootfs onto itself |
+| 10 | `mount_proc` *(optional, `--proc`)* | mount a fresh `/proc` |
+| 11 | `bind_device` *(optional, `--device`)* | bind host device nodes into `rootfs/dev` |
+| 12 | `chroot_rootfs` | `chroot(rootfs)` |
+| 13 | `chdir_work` | `chdir(workdir)` |
+| 14 | `pin_cpus` *(optional, `--cpus`)* | `sched_setaffinity` to the named CPUs |
+| 15 | `exec_cmd` | `execve` with a `/bin`, `/usr/bin`, … search and the minimal env |
 
 Because this environment forbids a child writing its own `uid_map`, the
 `uid_map`/`gid_map` edges are generated as parent-side helpers — the same
@@ -116,12 +132,22 @@ Full write-ups, including failure modes:
 
 - [`docs/RESULTS-2026-11-10.md`](docs/RESULTS-2026-11-10.md) — design, calibration, failure forms
 - [`docs/RESULTS-view-2026-11-10.md`](docs/RESULTS-view-2026-11-10.md) — the `--view` / dynamic room identity extension
+- [`docs/RESULTS-netdev-2026-11-12.md`](docs/RESULTS-netdev-2026-11-12.md) — network namespace, CPU pinning and device binds (incl. an honest record of the wrong clone-flag constant that the pre-registered census caught)
 
 ## Limitations
 
 - x86-64 only.
 - `chroot`, not `pivot_root`.
-- No `/dev` construction: the room gets the rootfs's `/dev` as-is.
+- `/dev` is the rootfs's as-is, plus exactly the devices bound in
+  with `--device`; there is no general device construction.
+- Network is binary: shared with the host (default), or `--net`
+  loopback-only isolation. There is no veth/NAT, so a `--net` room
+  cannot reach the outside at all.
+- CPU control is pinning only (`sched_setaffinity`); there are no
+  cgroup quotas.
+- GPU hand-in is implemented as device binds but is **unverified on
+  real hardware** (the development host has no GPU); a missing
+  device node is refused by name.
 - Mounting a fresh `/proc` (`--proc`) may be refused by the host
   (EPERM); the edge then fails by name and the run stops.
 - This is a research artefact from the Link-theory project: a minimal,
@@ -153,7 +179,7 @@ Tools:
 |------|--------------|
 | `lwrap_build` | Build the lwrap ELF from a pole spec; returns size and sha256 |
 | `lwrap_rooms` | List the registered room aliases (see below) |
-| `lwrap_run` | Run a command inside a room (`--root`, optional `--pid` / `--proc` / `--workdir`); returns stdout, stderr, exit code |
+| `lwrap_run` | Run a command inside a room (`--root`, optional `--pid` / `--proc` / `--net` / `--workdir` / `cpus` / `devices`); returns stdout, stderr, exit code |
 | `lwrap_view` | Print a room's composed identity from `DIR/.lwrap.lnk`, without entering it |
 | `lwrap_put` | Store a file onto a room's floor (write into its rootfs); returns size and sha256 |
 | `lwrap_get` | Load a file from a room's floor (text, or base64 for binary); returns size and sha256 |
