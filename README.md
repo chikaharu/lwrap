@@ -158,6 +158,7 @@ Tools:
 | `lwrap_put` | Store a file onto a room's floor (write into its rootfs); returns size and sha256 |
 | `lwrap_get` | Load a file from a room's floor (text, or base64 for binary); returns size and sha256 |
 | `lwrap_ls` | List a directory inside a room, without entering it |
+| `lwrap_read` | Read a line-carry file by line-number coordinates (below) |
 
 With put/get/ls an AI client can do file work end-to-end inside a
 room: store data and a script, run the script in isolation with
@@ -166,6 +167,20 @@ and containment is enforced on the resolved real path: a `..` that
 climbs above the room's root, and a symlink planted inside the room
 pointing outside, are both refused by name (`path_escapes_room`).
 Put/get are capped at 256 KiB per file.
+
+### Line-carry reading
+
+A line-carry file (`.lcarry`) stores each line as a record
+`N<TAB>text`: every line *carries its own line number*, so the file
+is an address space keyed by those numbers, not by byte position.
+`lwrap_read` loads a range `[start, end]` by number — the records'
+physical order in the file is irrelevant (the bag may be shuffled,
+and is reconstructed exactly), a missing number is refused as
+`missing_line_number: N`, a duplicate as `duplicate_line_number: N`,
+and a file without number headers as `not_line_carry_format`.
+Measured on a shuffled 1,000-line file: range and full reads are
+byte-identical to the original, the format overhead is 1.097x, and
+head vs. tail range reads cost the same (ratio 1.10).
 
 ### Room aliases
 
@@ -211,7 +226,7 @@ lwrap_run all pass). A smoke test is included as `test_mcp.py`.
 ```
 sf_builder.py      the builder (spec validation + C generation + build)
 spec_lwrap.json    the pole spec (the source of truth for lwrap)
-mcp_server.py      stdlib-only MCP server exposing lwrap as 7 tools
+mcp_server.py      stdlib-only MCP server exposing lwrap as 8 tools
 rooms.example.json example room-alias registry (copy to rooms.json)
 test_mcp.py        stdlib smoke test for the MCP server
 docs/              format spec and measured results

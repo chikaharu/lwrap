@@ -12,6 +12,11 @@
 #   lwrap_put    store a file onto a room's floor (into its rootfs)
 #   lwrap_get    load a file from a room's floor
 #   lwrap_ls     list a directory inside a room
+#   lwrap_read   read a line-carry file by line-number coordinates:
+#                each record is "N\ttext" and carries its own number,
+#                so the physical order of records does not matter;
+#                a range [start, end] is loaded by number, and gaps
+#                or duplicates are refused by name
 #
 # put/get/ls treat the rootfs as the room's floor: files are stored
 # and loaded from the host side, under a strict containment rule --
@@ -65,7 +70,7 @@ import sys
 PROTOCOL_VERSION = "2024-11-05"
 SUPPORTED_VERSIONS = ["2024-11-05", "2025-03-26", "2025-06-18"]
 SERVER_NAME = "lwrap"
-SERVER_VERSION = "1.2.0"
+SERVER_VERSION = "1.3.0"
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 BUILDER = os.path.join(HERE, "sf_builder.py")
@@ -413,6 +418,71 @@ def tool_ls(args):
     return (json.dumps(info, indent=2, ensure_ascii=False), info, False)
 
 
+def tool_read(args):
+    rootfs, err = resolve_rootfs(args)
+    if err:
+        return (err, None, True)
+    host, norm, err = _room_target(rootfs, args.get("path"))
+    if err:
+        return (err, None, True)
+    if not os.path.exists(host):
+        return ("file_not_found: %s" % norm, None, True)
+    if os.path.isdir(host):
+        return ("not_a_file: %s is a directory" % norm, None, True)
+    size = os.path.getsize(host)
+    if size > MAX_FILE:
+        return ("file_too_large: %s is %d bytes (cap %d)"
+                % (norm, size, MAX_FILE), None, True)
+    with open(host, "rb") as f:
+        raw = f.read()
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError:
+        return ("not_line_carry_format: %s is not UTF-8 text" % norm,
+                None, True)
+    physical = text.split("\n")
+    if physical and physical[-1] == "":
+        physical.pop()
+    records = {}
+    for i, line in enumerate(physical, 1):
+        head, sep, body = line.partition("\t")
+        if not sep or not head.isdigit():
+            return ("not_line_carry_format: physical line %d of %s "
+                    "has no line-number header" % (i, norm), None, True)
+        n = int(head)
+        if n in records:
+            return ("duplicate_line_number: %d (in %s)" % (n, norm),
+                    None, True)
+        records[n] = body
+    if not records:
+        return ("not_line_carry_format: %s has no records" % norm,
+                None, True)
+    numbers = sorted(records)
+    gaps = [n for n in range(numbers[0], numbers[-1] + 1)
+            if n not in records]
+    try:
+        start = int(args.get("start") or 1)
+        end = int(args.get("end") or numbers[-1])
+    except (TypeError, ValueError):
+        return ("bad_argument: start/end must be integers", None, True)
+    if start < 1 or end < start:
+        return ("bad_argument: range [%s, %s]" % (start, end),
+                None, True)
+    for n in range(start, end + 1):
+        if n not in records:
+            return ("missing_line_number: %d (in %s)" % (n, norm),
+                    None, True)
+    lines = [{"n": n, "text": records[n]} for n in range(start, end + 1)]
+    info = {"path": norm, "start": start, "end": end,
+            "lines": lines,
+            "text": "".join(records[n] + "\n"
+                            for n in range(start, end + 1)),
+            "records": len(records),
+            "number_min": numbers[0], "number_max": numbers[-1],
+            "gap_count": len(gaps), "gaps": gaps[:50]}
+    return (json.dumps(info, indent=2, ensure_ascii=False), info, False)
+
+
 TOOLS = [
     {
         "name": "lwrap_build",
@@ -569,6 +639,40 @@ TOOLS = [
             },
         },
         "handler": tool_ls,
+    },
+    {
+        "name": "lwrap_read",
+        "description": "Read a line-carry file by line-number "
+                       "coordinates. The file's records are "
+                       "'N\\ttext' lines, each carrying its own "
+                       "number, so their physical order in the file "
+                       "does not matter (the bag may be shuffled). "
+                       "Returns the requested range in number order, "
+                       "plus a census (record count, number range, "
+                       "gaps). Missing or duplicate numbers are "
+                       "refused by name.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "rootfs": {"type": "string",
+                           "description": "Path to the room's rootfs. "
+                                          "Give either rootfs or room."},
+                "room": {"type": "string",
+                         "description": "Alias from the rooms registry "
+                                        "(see lwrap_rooms)."},
+                "path": {"type": "string",
+                         "description": "Room-absolute path of the "
+                                        "line-carry file."},
+                "start": {"type": "integer",
+                          "description": "First line number "
+                                         "(default 1)."},
+                "end": {"type": "integer",
+                        "description": "Last line number, inclusive "
+                                       "(default: the largest number)."},
+            },
+            "required": ["path"],
+        },
+        "handler": tool_read,
     },
 ]
 

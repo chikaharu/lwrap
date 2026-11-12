@@ -73,7 +73,7 @@ server.stdin.flush()
 tools = request("tools/list").get("result", {}).get("tools", [])
 check("tools/list", sorted(t["name"] for t in tools)
       == ["lwrap_build", "lwrap_get", "lwrap_ls", "lwrap_put",
-          "lwrap_rooms", "lwrap_run", "lwrap_view"],
+          "lwrap_read", "lwrap_rooms", "lwrap_run", "lwrap_view"],
       ",".join(t["name"] for t in tools))
 
 r = call("lwrap_rooms", {})
@@ -108,6 +108,20 @@ r = call("lwrap_get", {"room": "scratch", "path": "/peek"})
 check("get symlink escape refused", r.get("isError") is True
       and "path_escapes_room" in r["content"][0]["text"],
       r["content"][0]["text"])
+
+# Line-carry read: a shuffled bag of numbered records reads back in
+# number order; a plain file refuses by name.
+r = call("lwrap_put", {"room": "scratch", "path": "/nums.lcarry",
+                       "content": "3\tthree\n1\tone\n2\ttwo\n"})
+r = call("lwrap_read", {"room": "scratch", "path": "/nums.lcarry",
+                        "start": 1, "end": 2})
+info = json.loads(r["content"][0]["text"]) if not r.get("isError") else {}
+check("lwrap_read shuffled bag", info.get("text") == "one\ntwo\n",
+      json.dumps(info)[:80])
+r = call("lwrap_read", {"room": "scratch", "path": "/work/data.txt"})
+check("lwrap_read plain refused", r.get("isError") is True
+      and "not_line_carry_format" in r["content"][0]["text"],
+      r["content"][0]["text"][:80])
 r = call("lwrap_run", {"room": "demo", "command": ["/bin/true"]})
 check("alias resolves (run)", r.get("isError") is True
       and "edge bind_rootfs failed" in r["content"][0]["text"],
