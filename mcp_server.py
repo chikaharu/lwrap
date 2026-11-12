@@ -93,7 +93,7 @@ import sys
 PROTOCOL_VERSION = "2024-11-05"
 SUPPORTED_VERSIONS = ["2024-11-05", "2025-03-26", "2025-06-18"]
 SERVER_NAME = "lwrap"
-SERVER_VERSION = "1.6.0"
+SERVER_VERSION = "1.7.0"
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 BUILDER = os.path.join(HERE, "sf_builder.py")
@@ -640,7 +640,7 @@ def tool_read8(args):
             data = f.read(min(8 * (end - start + 1),
                               size - 8 * (start - 1)))
         info = {"path": norm, "format": "raw8", "start": start,
-                "end": end, "lines_total": nlines,
+                "end": end, "lines_total": nlines, "via": "arithmetic",
                 "kind": data_kind(data),
                 "byte_length": len(data),
                 "content_base64": base64.b64encode(data).decode("ascii")}
@@ -653,14 +653,65 @@ def tool_read8(args):
     # until lwrap_defrag folds it.
     with open(host, "rb") as f:
         blob = f.read()
-    parsed, perr = _bag_parse(blob)
-    if perr:
-        return ("%s (in %s)" % (perr, norm), None, True)
-    total_len, want_sha, nlines, entries = parsed
+    if len(blob) < 48 or (len(blob) - 48) % 16 != 0:
+        return ("not_line8_bag_format: %s (bad length %d)"
+                % (norm, len(blob)), None, True)
+    total_len = int.from_bytes(blob[8:16], "little")
+    want_sha = blob[16:48]
+    nlines = (total_len + 7) // 8
     if end is None:
         end = nlines
     if start < 1 or end < start or end > nlines:
         return range_err(nlines)
+    # Read as fragments, always. If the bag is clean-shaped and
+    # the requested records sit exactly where the arithmetic fold
+    # puts them (tag == line at offset 48+16*(n-1)), the ledger is
+    # the formula and no scan happens. Verification is deferred
+    # on this path -- settlement is defrag's job -- unless a
+    # fresh fold ledger settles it here.
+    if len(blob) == 48 + 16 * nlines:
+        probed = {}
+        ok = True
+        for n in range(start, end + 1):
+            off = 48 + 16 * (n - 1)
+            if int.from_bytes(blob[off:off + 8], "little") != n:
+                ok = False
+                break
+            probed[n] = blob[off + 8:off + 16]
+        if ok:
+            data = b"".join(probed[n] for n in range(start, end + 1))
+            data = data[:max(0, min(len(data),
+                                    total_len - 8 * (start - 1)))]
+            verified, via_d = False, None
+            fold = _load_fold(host, len(blob))
+            if fold is not None and fold.get("sha256") \
+                    and not fold.get("gaps"):
+                offs = fold.get("offsets") or []
+                if len(offs) == nlines and None not in offs:
+                    full = b"".join(blob[o + 8:o + 16]
+                                    for o in offs)[:total_len]
+                    if hashlib.sha256(full).hexdigest() \
+                            != fold["sha256"]:
+                        return ("digest_mismatch: %s (bag data "
+                                "does not match its fold)" % norm,
+                                None, True)
+                    verified, via_d = True, "fold"
+            info = {"path": norm, "format": "bag8", "start": start,
+                    "end": end, "lines_total": nlines,
+                    "records": nlines, "generations": 0,
+                    "via": "arithmetic_fold",
+                    "digest_verified": verified, "digest_via": via_d,
+                    "kind": data_kind(data),
+                    "byte_length": len(data),
+                    "content_base64":
+                    base64.b64encode(data).decode("ascii")}
+            return (json.dumps(info, indent=2), info, False)
+    # The arithmetic fold did not hold: fall back to resolving
+    # the whole chain (generations, tombstones) by scan.
+    parsed, perr = _bag_parse(blob)
+    if perr:
+        return ("%s (in %s)" % (perr, norm), None, True)
+    _tl, _ws, _nl, entries = parsed
     state, deleted, generations, _wo = _bag_resolve(entries)
     missing = [n for n in range(start, end + 1) if n not in state]
     if missing:
@@ -690,7 +741,7 @@ def tool_read8(args):
     data = data[:max(0, min(len(data), total_len - 8 * (start - 1)))]
     info = {"path": norm, "format": "bag8", "start": start, "end": end,
             "lines_total": nlines, "records": len(entries),
-            "generations": generations,
+            "generations": generations, "via": "scan",
             "digest_verified": digest_verified,
             "digest_via": digest_via,
             "kind": data_kind(data),
@@ -829,7 +880,7 @@ def tool_defrag(args):
     host, norm, blob, parsed, errt = _open_bag(args)
     if errt:
         return errt
-    total_len, _sha, nlines, entries = parsed
+    total_len, want_sha, nlines, entries = parsed
     state, _deleted, generations, winner_off = _bag_resolve(entries)
     gaps = [n for n in range(1, nlines + 1) if n not in state]
     digest = None
@@ -837,6 +888,17 @@ def tool_defrag(args):
         full = b"".join(state[n]
                         for n in range(1, nlines + 1))[:total_len]
         digest = hashlib.sha256(full).hexdigest()
+    # Settlement checks the header where the header is
+    # authoritative: a clean-shaped, generation-free bag whose
+    # header carries a real digest must match it, or the fold
+    # refuses to settle tampered content as truth.
+    if digest is not None and generations == 0 \
+            and len(blob) == 48 + 16 * nlines \
+            and want_sha != b"\x00" * 32 \
+            and digest != want_sha.hex():
+        return ("digest_mismatch: %s (bag data does not match its "
+                "header; defrag refuses to settle it)" % norm,
+                None, True)
     fold = {"format": "lwrap-fold8-1", "bag_size": len(blob),
             "total_len": total_len, "sha256": digest,
             "offsets": [winner_off.get(n) for n in

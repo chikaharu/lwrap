@@ -241,6 +241,26 @@ The fold's value in this form is not speed but that the bag
 never changes: offsets stay stable and the digest settles in
 place. `lwrap_rm` removes a file together with its ledger.
 
+### Reading as fragments, always
+
+`lwrap_read8` reads every bag *as a chain of fragments* and
+resolves before loading — whether or not the bag is actually
+fragmented. An ordered bag is the special case whose ledger is
+a formula: if the bag is clean-shaped and each requested
+record's tag matches its arithmetic offset `48 + 16*(n-1)`, the
+read is served with no scan (`via: "arithmetic_fold"`; measured
+0.27 ms at 20,000 lines vs 21.1 ms for the scan path, and flat
+against a 10x size change). If a probe misses — the physical
+order is not the logical order — the read falls back to full
+generation resolution (`via: "scan"`), so a physically swapped
+bag still reads correctly where a blind seek would silently
+serve the wrong line. Verification moves to settlement: the
+arithmetic path declares `digest_verified: false`, a fresh fold
+ledger verifies in place, and `lwrap_defrag` itself refuses to
+settle a clean bag whose content contradicts its header
+(`digest_mismatch`). Defragging an ordered bag materializes
+exactly the formula — every offset equals `48 + 16*(n-1)`.
+
 ### Room aliases
 
 Rooms can be called by name instead of by absolute path. Create a
