@@ -73,7 +73,8 @@ server.stdin.flush()
 tools = request("tools/list").get("result", {}).get("tools", [])
 check("tools/list", sorted(t["name"] for t in tools)
       == ["lwrap_build", "lwrap_get", "lwrap_ls", "lwrap_put",
-          "lwrap_read", "lwrap_rooms", "lwrap_run", "lwrap_view"],
+          "lwrap_read", "lwrap_read8", "lwrap_rooms", "lwrap_run",
+          "lwrap_view"],
       ",".join(t["name"] for t in tools))
 
 r = call("lwrap_rooms", {})
@@ -122,6 +123,31 @@ r = call("lwrap_read", {"room": "scratch", "path": "/work/data.txt"})
 check("lwrap_read plain refused", r.get("isError") is True
       and "not_line_carry_format" in r["content"][0]["text"],
       r["content"][0]["text"][:80])
+
+# 8-byte lines: line n is at byte offset 8*n; a shuffled bag of
+# [tag 8B][data 8B] records under a 48-byte header reads back whole.
+import base64 as _b64
+import hashlib as _hl
+import struct as _st
+blob = bytes(range(256)) * 2  # 512 bytes = 64 lines
+r = call("lwrap_put", {"room": "scratch", "path": "/raw.bin",
+                       "content_base64": _b64.b64encode(blob).decode()})
+r = call("lwrap_read8", {"room": "scratch", "path": "/raw.bin",
+                         "start": 10, "end": 12})
+info = json.loads(r["content"][0]["text"]) if not r.get("isError") else {}
+check("lwrap_read8 raw8 seek", _b64.b64decode(
+    info.get("content_base64", "")) == blob[80:96], json.dumps(info)[:80])
+recs = [_st.pack("<Q", n) + blob[8 * n:8 * n + 8] for n in range(64)]
+recs.reverse()
+bag = b"LCARRY8\x00" + _st.pack("<Q", len(blob)) \
+    + _hl.sha256(blob).digest() + b"".join(recs)
+r = call("lwrap_put", {"room": "scratch", "path": "/bag.bag8",
+                       "content_base64": _b64.b64encode(bag).decode()})
+r = call("lwrap_read8", {"room": "scratch", "path": "/bag.bag8"})
+info = json.loads(r["content"][0]["text"]) if not r.get("isError") else {}
+check("lwrap_read8 bag8 shuffled", _b64.b64decode(
+    info.get("content_base64", "")) == blob
+    and info.get("digest_verified") is True, json.dumps(info)[:80])
 r = call("lwrap_run", {"room": "demo", "command": ["/bin/true"]})
 check("alias resolves (run)", r.get("isError") is True
       and "edge bind_rootfs failed" in r["content"][0]["text"],

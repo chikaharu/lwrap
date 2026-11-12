@@ -159,6 +159,7 @@ Tools:
 | `lwrap_get` | Load a file from a room's floor (text, or base64 for binary); returns size and sha256 |
 | `lwrap_ls` | List a directory inside a room, without entering it |
 | `lwrap_read` | Read a line-carry file by line-number coordinates (below) |
+| `lwrap_read8` | Read an address space of 8-byte lines (below) |
 
 With put/get/ls an AI client can do file work end-to-end inside a
 room: store data and a script, run the script in isolation with
@@ -181,6 +182,28 @@ and a file without number headers as `not_line_carry_format`.
 Measured on a shuffled 1,000-line file: range and full reads are
 byte-identical to the original, the format overhead is 1.097x, and
 head vs. tail range reads cost the same (ratio 1.10).
+
+### 8-byte lines
+
+Generalize the unit from a text line to 8 bytes: the address space
+is cut into 8-byte lines, the line number *is* the address, and the
+byte offset is `8 * n`. `lwrap_read8` reads a range `[start, end)`
+of line numbers in two forms:
+
+- **raw8** — the file itself is the lines. Reading seeks
+  arithmetically: no scan, no index table. Measured: the same
+  16-line read costs the same on a 32 KiB and a 256 KiB file
+  (ratio 1.06; a scanning reader would pay ~8x). Overhead: zero.
+- **bag8** — a 48-byte header (magic, total byte length, sha256)
+  plus records of `[tag 8B][data 8B]`, each line explicitly
+  carrying its number, so records may lie in any physical order.
+  A complete bag is digest-verified on every read; a dropped
+  record refuses as `missing_line_number` only for ranges that
+  cover it, a duplicate as `duplicate_line_number`, and any
+  flipped data byte as `digest_mismatch`. Cost: exactly 2.001x —
+  the symmetric point of carrying an 8-byte tag per 8 bytes of
+  data. Placement freedom is bought with the tag; in-place is free
+  because the number is arithmetic.
 
 ### Room aliases
 
@@ -226,7 +249,7 @@ lwrap_run all pass). A smoke test is included as `test_mcp.py`.
 ```
 sf_builder.py      the builder (spec validation + C generation + build)
 spec_lwrap.json    the pole spec (the source of truth for lwrap)
-mcp_server.py      stdlib-only MCP server exposing lwrap as 8 tools
+mcp_server.py      stdlib-only MCP server exposing lwrap as 9 tools
 rooms.example.json example room-alias registry (copy to rooms.json)
 test_mcp.py        stdlib smoke test for the MCP server
 docs/              format spec and measured results

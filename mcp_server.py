@@ -17,6 +17,14 @@
 #                so the physical order of records does not matter;
 #                a range [start, end] is loaded by number, and gaps
 #                or duplicates are refused by name
+#   lwrap_read8  read an address space whose lines are 8 bytes:
+#                the line number IS the address (byte offset = 8*n).
+#                raw8: the file itself is the lines; reading seeks
+#                arithmetically, no scan and no index. bag8: records
+#                of [tag 8B = line number][data 8B] under a 48-byte
+#                header (magic / total length / sha256); physical
+#                order is free, and a complete census is always
+#                digest-verified
 #
 # put/get/ls treat the rootfs as the room's floor: files are stored
 # and loaded from the host side, under a strict containment rule --
@@ -70,7 +78,7 @@ import sys
 PROTOCOL_VERSION = "2024-11-05"
 SUPPORTED_VERSIONS = ["2024-11-05", "2025-03-26", "2025-06-18"]
 SERVER_NAME = "lwrap"
-SERVER_VERSION = "1.3.0"
+SERVER_VERSION = "1.4.0"
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 BUILDER = os.path.join(HERE, "sf_builder.py")
@@ -483,6 +491,100 @@ def tool_read(args):
     return (json.dumps(info, indent=2, ensure_ascii=False), info, False)
 
 
+BAG8_MAGIC = b"LCARRY8\x00"
+READ8_CAP = 4 * 1024 * 1024
+
+
+def tool_read8(args):
+    rootfs, err = resolve_rootfs(args)
+    if err:
+        return (err, None, True)
+    host, norm, err = _room_target(rootfs, args.get("path"))
+    if err:
+        return (err, None, True)
+    if not os.path.exists(host):
+        return ("file_not_found: %s" % norm, None, True)
+    if os.path.isdir(host):
+        return ("not_a_file: %s is a directory" % norm, None, True)
+    size = os.path.getsize(host)
+    if size > READ8_CAP:
+        return ("file_too_large: %s is %d bytes (cap %d)"
+                % (norm, size, READ8_CAP), None, True)
+    try:
+        start = int(args.get("start") or 0)
+        end = args.get("end")
+        end = None if end is None else int(end)
+    except (TypeError, ValueError):
+        return ("bad_argument: start/end must be integers", None, True)
+
+    with open(host, "rb") as f:
+        head = f.read(len(BAG8_MAGIC))
+    is_bag = (head == BAG8_MAGIC)
+
+    if not is_bag:
+        # raw8: the file itself is the lines; seek arithmetically.
+        nlines = (size + 7) // 8
+        if end is None:
+            end = nlines
+        if start < 0 or end < start or end > nlines:
+            return ("line_out_of_range: [%d, %d) of %d lines (in %s)"
+                    % (start, end, nlines, norm), None, True)
+        with open(host, "rb") as f:
+            f.seek(8 * start)
+            data = f.read(min(8 * (end - start), size - 8 * start))
+        info = {"path": norm, "format": "raw8", "start": start,
+                "end": end, "lines_total": nlines,
+                "byte_length": len(data),
+                "content_base64": base64.b64encode(data).decode("ascii")}
+        return (json.dumps(info, indent=2), info, False)
+
+    # bag8: header 48B + records of [tag u64 LE][data 8B].
+    with open(host, "rb") as f:
+        blob = f.read()
+    if len(blob) < 48 or (len(blob) - 48) % 16 != 0:
+        return ("not_line8_bag_format: %s (bad length %d)"
+                % (norm, len(blob)), None, True)
+    total_len = int.from_bytes(blob[8:16], "little")
+    want_sha = blob[16:48]
+    nlines = (total_len + 7) // 8
+    if end is None:
+        end = nlines
+    if start < 0 or end < start or end > nlines:
+        return ("line_out_of_range: [%d, %d) of %d lines (in %s)"
+                % (start, end, nlines, norm), None, True)
+    records = {}
+    body = blob[48:]
+    for off in range(0, len(body), 16):
+        tag = int.from_bytes(body[off:off + 8], "little")
+        if tag in records:
+            return ("duplicate_line_number: %d (in %s)" % (tag, norm),
+                    None, True)
+        if tag >= nlines:
+            return ("not_line8_bag_format: tag %d beyond %d lines "
+                    "(in %s)" % (tag, nlines, norm), None, True)
+        records[tag] = body[off + 8:off + 16]
+    missing = [n for n in range(start, end) if n not in records]
+    if missing:
+        return ("missing_line_number: %d (in %s)" % (missing[0], norm),
+                None, True)
+    complete = len(records) == nlines
+    digest_verified = False
+    if complete:
+        full = b"".join(records[n] for n in range(nlines))[:total_len]
+        if hashlib.sha256(full).digest() != want_sha:
+            return ("digest_mismatch: %s (bag data does not match "
+                    "its header)" % norm, None, True)
+        digest_verified = True
+    data = b"".join(records[n] for n in range(start, end))
+    data = data[:max(0, min(len(data), total_len - 8 * start))]
+    info = {"path": norm, "format": "bag8", "start": start, "end": end,
+            "lines_total": nlines, "records": len(records),
+            "digest_verified": digest_verified,
+            "byte_length": len(data),
+            "content_base64": base64.b64encode(data).decode("ascii")}
+    return (json.dumps(info, indent=2), info, False)
+
+
 TOOLS = [
     {
         "name": "lwrap_build",
@@ -673,6 +775,43 @@ TOOLS = [
             "required": ["path"],
         },
         "handler": tool_read,
+    },
+    {
+        "name": "lwrap_read8",
+        "description": "Read an address space whose lines are 8 "
+                       "bytes: the line number is the address, the "
+                       "byte offset is 8*n. Range is [start, end) in "
+                       "line numbers (0-based). Two forms: raw8 -- "
+                       "the file itself is the lines and reading "
+                       "seeks arithmetically (no scan, no index); "
+                       "bag8 -- a header (magic, total length, "
+                       "sha256) plus records of [tag 8B][data 8B] "
+                       "whose physical order is free; a complete "
+                       "bag is digest-verified on every read. "
+                       "Returns base64 content. Missing, duplicate "
+                       "and out-of-range lines are refused by name.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "rootfs": {"type": "string",
+                           "description": "Path to the room's rootfs. "
+                                          "Give either rootfs or room."},
+                "room": {"type": "string",
+                         "description": "Alias from the rooms registry "
+                                        "(see lwrap_rooms)."},
+                "path": {"type": "string",
+                         "description": "Room-absolute path of the "
+                                        "raw8 or bag8 file."},
+                "start": {"type": "integer",
+                          "description": "First line number, 0-based "
+                                         "(default 0)."},
+                "end": {"type": "integer",
+                        "description": "Line number past the last to "
+                                       "read (default: all lines)."},
+            },
+            "required": ["path"],
+        },
+        "handler": tool_read8,
     },
 ]
 
