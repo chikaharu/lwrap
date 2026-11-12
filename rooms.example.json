@@ -1,0 +1,12 @@
+{
+  "rooms": {
+    "rouka": {
+      "description": "a room directory holding .lwrap.lnk (for lwrap_view)",
+      "dir": "/path/to/rooms/rouka"
+    },
+    "test": {
+      "description": "a disposable test room (for lwrap_run)",
+      "rootfs": "/path/to/rootfs"
+    }
+  }
+}

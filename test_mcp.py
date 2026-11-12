@@ -17,6 +17,17 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 _id = [0]
 failures = []
 
+# A throwaway alias registry, so the alias tests do not depend on a
+# local rooms.json: "demo" resolves to paths that do not exist, which
+# is enough to prove resolution happened (the refusal names the edge).
+import tempfile
+_reg = tempfile.NamedTemporaryFile("w", suffix=".json", delete=False)
+json.dump({"rooms": {"demo": {"rootfs": "/nonexistent-rootfs",
+                              "dir": "/nonexistent-room",
+                              "description": "demo alias"}}}, _reg)
+_reg.close()
+os.environ["LWRAP_ROOMS_JSON"] = _reg.name
+
 
 def check(name, ok, detail=""):
     print("%s %s %s" % ("PASS" if ok else "FAIL", name, detail))
@@ -56,8 +67,30 @@ server.stdin.flush()
 
 tools = request("tools/list").get("result", {}).get("tools", [])
 check("tools/list", sorted(t["name"] for t in tools)
-      == ["lwrap_build", "lwrap_run", "lwrap_view"],
+      == ["lwrap_build", "lwrap_rooms", "lwrap_run", "lwrap_view"],
       ",".join(t["name"] for t in tools))
+
+r = call("lwrap_rooms", {})
+info = json.loads(r["content"][0]["text"])
+check("lwrap_rooms", [x["name"] for x in info["rooms"]] == ["demo"],
+      json.dumps(info["rooms"]))
+r = call("lwrap_run", {"room": "demo", "command": ["/bin/true"]})
+check("alias resolves (run)", r.get("isError") is True
+      and "edge bind_rootfs failed" in r["content"][0]["text"],
+      "demo -> /nonexistent-rootfs")
+r = call("lwrap_run", {"room": "bogus", "command": ["/bin/true"]})
+check("unknown alias refused", r.get("isError") is True
+      and "unknown_room_alias: bogus" in r["content"][0]["text"],
+      r["content"][0]["text"])
+r = call("lwrap_run", {"room": "demo", "rootfs": "/x",
+                       "command": ["/bin/true"]})
+check("room+rootfs conflict refused", r.get("isError") is True
+      and "conflicting_arguments" in r["content"][0]["text"],
+      r["content"][0]["text"])
+r = call("lwrap_view", {"room": "demo"})
+check("alias resolves (view)", r.get("isError") is True
+      and "no .lwrap.lnk" in r["content"][0]["text"],
+      r["content"][0]["text"].strip()[:80])
 
 r = call("lwrap_build", {})
 info = {}

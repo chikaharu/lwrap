@@ -6,8 +6,24 @@
 # room*, through lwrap:
 #
 #   lwrap_build  build the lwrap ELF from a pole spec (sf_builder.py)
+#   lwrap_rooms  list the room aliases from the registry (rooms.json)
 #   lwrap_run    run a command inside a room (lwrap --root ... -- CMD)
 #   lwrap_view   print a room's composed identity (lwrap --view DIR)
+#
+# Rooms can be called by alias instead of by absolute path. The
+# registry is a JSON file: rooms.json beside this script, or the path
+# in the LWRAP_ROOMS_JSON environment variable:
+#
+#   {"rooms": {
+#       "test":  {"rootfs": "/path/to/rootfs",
+#                 "description": "a disposable test room"},
+#       "rouka": {"dir": "/path/to/rooms/rouka",
+#                 "description": "a room with a .lwrap.lnk, for view"}}}
+#
+# An entry may carry "rootfs" (for lwrap_run), "dir" (for lwrap_view),
+# or both. The registry is re-read on every call, so editing it takes
+# effect without restarting the server. Unknown aliases are refused
+# by name. See rooms.example.json.
 #
 # MCP is the plumbing; lwrap is the room. The server adds no state of
 # its own beyond the lwrap directory (the folder holding this script,
@@ -39,7 +55,7 @@ import sys
 PROTOCOL_VERSION = "2024-11-05"
 SUPPORTED_VERSIONS = ["2024-11-05", "2025-03-26", "2025-06-18"]
 SERVER_NAME = "lwrap"
-SERVER_VERSION = "1.0.0"
+SERVER_VERSION = "1.1.0"
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 BUILDER = os.path.join(HERE, "sf_builder.py")
@@ -54,6 +70,73 @@ MAX_TIMEOUT = 120
 def log(msg):
     sys.stderr.write("lwrap-mcp: %s\n" % msg)
     sys.stderr.flush()
+
+
+# ------------------------------------------------------------------
+# Room alias registry (rooms.json). Re-read on every call: the
+# registry is data on the floor, not state in the server.
+# ------------------------------------------------------------------
+
+REGISTRY_ENV = "LWRAP_ROOMS_JSON"
+DEFAULT_REGISTRY = os.path.join(HERE, "rooms.json")
+
+
+def registry_path():
+    return os.environ.get(REGISTRY_ENV) or DEFAULT_REGISTRY
+
+
+def load_registry():
+    """Return (rooms_dict, error_text). No registry file is not an
+    error: it simply means no aliases are registered."""
+    path = registry_path()
+    if not os.path.isfile(path):
+        return {}, None
+    try:
+        with open(path) as f:
+            data = json.load(f)
+    except (OSError, ValueError) as e:
+        return None, "rooms_registry_invalid: %s (%s)" % (path, e)
+    rooms = data.get("rooms") if isinstance(data, dict) else None
+    if not isinstance(rooms, dict):
+        return None, ("rooms_registry_invalid: %s "
+                      "(expected an object with a 'rooms' object)" % path)
+    for name, entry in rooms.items():
+        if not isinstance(entry, dict):
+            return None, ("rooms_registry_invalid: entry %r "
+                          "is not an object" % name)
+    return rooms, None
+
+
+def resolve_alias(alias, field):
+    """Resolve an alias to its 'rootfs' or 'dir' path.
+    Return (path, error_text)."""
+    rooms, err = load_registry()
+    if err:
+        return None, err
+    entry = rooms.get(alias)
+    if entry is None:
+        known = ", ".join(sorted(rooms)) or "(none)"
+        return None, "unknown_room_alias: %s (known: %s)" % (alias, known)
+    path = entry.get(field)
+    if not path:
+        return None, "room_has_no_%s: %s" % (field, alias)
+    return path, None
+
+
+def tool_rooms(args):
+    rooms, err = load_registry()
+    if err:
+        return (err, None, True)
+    listing = []
+    for name in sorted(rooms):
+        entry = rooms[name]
+        item = {"name": name}
+        for field in ("rootfs", "dir", "description"):
+            if entry.get(field):
+                item[field] = entry[field]
+        listing.append(item)
+    info = {"registry": registry_path(), "rooms": listing}
+    return (json.dumps(info, indent=2, ensure_ascii=False), info, False)
 
 
 # ------------------------------------------------------------------
@@ -100,8 +183,15 @@ def tool_run(args):
     if missing:
         return (missing, None, True)
     rootfs = args.get("rootfs")
+    if args.get("room") and rootfs:
+        return ("conflicting_arguments: give room or rootfs, not both",
+                None, True)
+    if args.get("room"):
+        rootfs, err = resolve_alias(str(args["room"]), "rootfs")
+        if err:
+            return (err, None, True)
     if not rootfs:
-        return ("missing_argument: rootfs", None, True)
+        return ("missing_argument: rootfs (or room, an alias)", None, True)
     command = args.get("command")
     if not command or not isinstance(command, list):
         return ("missing_argument: command (a non-empty array)", None, True)
@@ -137,8 +227,15 @@ def tool_view(args):
     if missing:
         return (missing, None, True)
     room = args.get("dir")
+    if args.get("room") and room:
+        return ("conflicting_arguments: give room or dir, not both",
+                None, True)
+    if args.get("room"):
+        room, err = resolve_alias(str(args["room"]), "dir")
+        if err:
+            return (err, None, True)
     if not room:
-        return ("missing_argument: dir", None, True)
+        return ("missing_argument: dir (or room, an alias)", None, True)
     proc = subprocess.run([LWRAP, "--view", str(room)],
                           stdin=subprocess.DEVNULL,
                           capture_output=True, timeout=30)
@@ -170,6 +267,15 @@ TOOLS = [
         "handler": tool_build,
     },
     {
+        "name": "lwrap_rooms",
+        "description": "List the registered room aliases (rooms.json): "
+                       "the names lwrap_run and lwrap_view accept as "
+                       "their 'room' argument, with the paths they "
+                       "resolve to.",
+        "inputSchema": {"type": "object", "properties": {}},
+        "handler": tool_rooms,
+    },
+    {
         "name": "lwrap_run",
         "description": "Run a command inside an lwrap room "
                        "(user/mount namespaces + chroot into rootfs). "
@@ -179,7 +285,12 @@ TOOLS = [
             "type": "object",
             "properties": {
                 "rootfs": {"type": "string",
-                           "description": "Path to the room's rootfs."},
+                           "description": "Path to the room's rootfs. "
+                                          "Give either rootfs or room."},
+                "room": {"type": "string",
+                         "description": "Alias from the rooms registry "
+                                        "(see lwrap_rooms); resolves to "
+                                        "that room's rootfs."},
                 "command": {"type": "array", "items": {"type": "string"},
                             "description": "Command and arguments to run "
                                            "inside the room."},
@@ -195,7 +306,7 @@ TOOLS = [
                                 "description": "Timeout in seconds "
                                                "(default 15, max 120)."},
             },
-            "required": ["rootfs", "command"],
+            "required": ["command"],
         },
         "handler": tool_run,
     },
@@ -208,9 +319,13 @@ TOOLS = [
             "type": "object",
             "properties": {
                 "dir": {"type": "string",
-                        "description": "Room directory holding .lwrap.lnk."},
+                        "description": "Room directory holding .lwrap.lnk. "
+                                       "Give either dir or room."},
+                "room": {"type": "string",
+                         "description": "Alias from the rooms registry "
+                                        "(see lwrap_rooms); resolves to "
+                                        "that room's dir."},
             },
-            "required": ["dir"],
         },
         "handler": tool_view,
     },
