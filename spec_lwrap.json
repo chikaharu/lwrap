@@ -1,0 +1,132 @@
+{
+  "edges": [
+    {
+      "glue": "create the user namespace: the room gets its own uid table",
+      "name": "unshare_user",
+      "syscalls": [
+        "unshare(CLONE_NEWUSER)"
+      ]
+    },
+    {
+      "glue": "precondition for writing gid_map",
+      "name": "deny_setgroups",
+      "syscalls": [
+        "write /proc/self/setgroups = deny"
+      ]
+    },
+    {
+      "glue": "map inner uid (param uid) to the caller's uid: inside, we are root",
+      "name": "write_uid_map",
+      "syscalls": [
+        "write /proc/self/uid_map = '0 <outer uid> 1'"
+      ]
+    },
+    {
+      "glue": "same mapping for gid",
+      "name": "write_gid_map",
+      "syscalls": [
+        "write /proc/self/gid_map = '0 <outer gid> 1'"
+      ]
+    },
+    {
+      "glue": "create the mount namespace: mounts made here stay inside the room",
+      "name": "unshare_mount",
+      "syscalls": [
+        "unshare(CLONE_NEWNS)"
+      ]
+    },
+    {
+      "glue": "child becomes pid 1 of a new pid namespace; parent waits and propagates the exit code",
+      "name": "unshare_pid",
+      "optional": true,
+      "runtime_flag": "--pid",
+      "syscalls": [
+        "unshare(CLONE_NEWPID)",
+        "fork"
+      ]
+    },
+    {
+      "glue": "stop mount propagation leaking out of the room",
+      "name": "mount_private_root",
+      "syscalls": [
+        "mount(none, /, MS_REC|MS_PRIVATE)"
+      ]
+    },
+    {
+      "glue": "the rootfs becomes a mount point, so chroot has a clean tree",
+      "name": "bind_rootfs",
+      "syscalls": [
+        "mount(rootfs, rootfs, MS_BIND|MS_REC)"
+      ]
+    },
+    {
+      "glue": "a fresh /proc matching the (possibly new) pid namespace",
+      "name": "mount_proc",
+      "optional": true,
+      "runtime_flag": "--proc",
+      "syscalls": [
+        "mount(proc, rootfs/proc, proc)"
+      ]
+    },
+    {
+      "glue": "cross the threshold: / is now the rootfs",
+      "name": "chroot_rootfs",
+      "syscalls": [
+        "chroot(rootfs)"
+      ]
+    },
+    {
+      "glue": "chroot leaves cwd outside; step into the room's workdir",
+      "name": "chdir_work",
+      "syscalls": [
+        "chdir(workdir)"
+      ]
+    },
+    {
+      "glue": "the pole's algorithm runs: the command replaces this process",
+      "name": "exec_cmd",
+      "syscalls": [
+        "execve(cmd, argv, minimal env)"
+      ]
+    }
+  ],
+  "params": {
+    "gid": 0,
+    "pid": false,
+    "proc": false,
+    "rootfs": "./rootfs",
+    "uid": 0,
+    "workdir": "/"
+  },
+  "pole": {
+    "description": "bwrap rewritten in Link edge notation: the pole is the room (an isolated process environment); the builder generates the edges (named syscall steps) that glue the outside of the room to its inside.",
+    "inputs": {
+      "argv": [
+        "--root DIR",
+        "--proc",
+        "--pid",
+        "--workdir DIR",
+        "-- CMD..."
+      ],
+      "env": "not inherited; the edge exec_cmd installs a minimal generated env (PATH, HOME, TERM)",
+      "fds": [
+        0,
+        1,
+        2
+      ]
+    },
+    "name": "lwrap",
+    "outputs": {
+      "exit": "the command's exit code, propagated (also through the unshare_pid fork)",
+      "stderr": "the command's stderr; lwrap's own edge failures are named on stderr",
+      "stdout": "the command's stdout, inherited unchanged"
+    },
+    "states": [
+      "host process",
+      "userns mapped (uid inner=0)",
+      "private mount tree",
+      "inside rootfs (chroot)",
+      "command process"
+    ]
+  }
+}
